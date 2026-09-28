@@ -5,8 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "chromadb>=1.5.9",
+    "docling>=2.130.0",
+    "fastembed>=0.8.1",
     "langchain>=1.4.2",
+    "langchain-chroma>=1.1.0",
+    "langchain-classic>=1.0.8",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.6.5",
+    "langchain-huggingface>=1.2.2",
     "langgraph>=1.2.12",
     "python-dotenv>=1.2.3",
+    "sentence-transformers>=6.1.0",
     "typesafe-sdk>=0.7.1",
 ]
