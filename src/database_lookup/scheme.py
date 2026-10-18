@@ -37,7 +37,6 @@ class Scheme:
                             "admin_id": self.admin_id,
                             "table_name": table,
                             "dialect": self.db.dialect,
-                            # exact CREATE TABLE text the LLM will use to write SQL
                             "table_info": self.db.get_table_info([table]),
                         }
                     )

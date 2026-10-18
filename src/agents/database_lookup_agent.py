@@ -18,7 +18,7 @@ from sqlalchemy.engine import Engine
 
 from typesafe_sdk import TypeSafeClient, Choice
 
-from src.scheme_retrieval import SchemeRetriever  # adjust to your path
+from src.database_lookup.retrieval import SchemeRetriever
 
 load_dotenv()
 
@@ -61,7 +61,7 @@ MAX_ROWS = 50
 class DBLookupContext:
     admin_id: str
     user_id: str
-    engine: Engine  # created once in FastAPI state, shared with the schema upload
+    engine: Engine
 
 
 class DBLookupState(TypedDict):
@@ -81,8 +81,6 @@ class DBLookupState(TypedDict):
     db_status: Optional[Literal["ok", "failed"]]
 
 
-# ---------- nodes ----------
-
 def preprocess_node(state: DBLookupState) -> dict:
     messages = state.get("messages", [])
     if not messages:
@@ -91,7 +89,6 @@ def preprocess_node(state: DBLookupState) -> dict:
         latest_msg = messages[-1]
         cleaned_query = latest_msg.content if hasattr(latest_msg, "content") else str(latest_msg)
 
-    # table_store is kept across turns, everything else is reset
     return {
         "current_query": cleaned_query,
         "rewritten_query": cleaned_query,
@@ -417,7 +414,6 @@ def sql_guard_node(state: DBLookupState) -> dict:
     question = state.get("current_query", "")
     schema = state.get("schema", "")
 
-    # cheap checks first, so we only call Jev when they pass
     if not lowered.startswith(("select", "with")):
         return {"sql_error": "The query must be a single SELECT statement."}
     if ";" in sql:
@@ -453,7 +449,6 @@ Generated SQL:
         )
         verdict = response.answers["safety"].choice
     except Exception as e:
-        # fail closed: if we cannot verify the query, we do not run it
         print(f"JEV SQL guard error: {e}. Treating the query as unsafe")
         verdict = "unsafe"
 
@@ -483,8 +478,6 @@ def sql_execution_node(state: DBLookupState, runtime: Runtime[DBLookupContext]) 
     except Exception as e:
         return {"sql_error": str(e)[:500]}
 
-
-# ---------- routing ----------
 
 def route_after_sufficiency(state: DBLookupState) -> Literal["query_rewriter", "build_schema"]:
     if state.get("decision") == "reuse":
@@ -623,3 +616,4 @@ def build_agent():
 
 
 build_workflow = build_agent
+

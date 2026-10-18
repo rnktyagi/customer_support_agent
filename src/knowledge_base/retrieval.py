@@ -2,7 +2,6 @@ import os
 from dotenv import load_dotenv
 import chromadb
 from chromadb import Search, K, Knn, Rrf
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from langchain_core.documents import Document
 
@@ -15,12 +14,7 @@ class Retriever:
             tenant=os.getenv("CHROMA_TENANT"),
             database=os.getenv("CHROMA_DATABASE"),
         )
-        self.collection = self.client.get_collection(
-            name="rag_data",
-            embedding_function=SentenceTransformerEmbeddingFunction(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            ),
-        )
+        self.collection = self.client.get_collection(name="rag_data")
         self.reranker = TextCrossEncoder(model_name="Xenova/ms-marco-MiniLM-L-6-v2")
 
     def retrieve(self, query, admin_id, top_k=5):

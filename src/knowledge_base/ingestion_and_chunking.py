@@ -9,7 +9,7 @@ from docling.datamodel.base_models import DocumentStream
 class Ingestion:
     def __init__(self):
         self.converter = DocumentConverter()
-        self.tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+        self.tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-base-en-v1.5")
         self.chunker = HybridChunker(tokenizer=self.tokenizer, max_tokens=600, merge_peers=True)
 
     def ingestion_and_chunking(self, file_bytes: bytes, filename: str):

@@ -4,13 +4,11 @@ from dotenv import load_dotenv
 import chromadb
 from chromadb import Schema, SparseVectorIndexConfig, K
 from chromadb.utils.embedding_functions import (
-    SentenceTransformerEmbeddingFunction,
     ChromaCloudSpladeEmbeddingFunction,
 )
 from src.knowledge_base.ingestion_and_chunking import Ingestion
 
 load_dotenv()
-
 
 class Embedding:
     def __init__(self):
@@ -21,11 +19,13 @@ class Embedding:
             database=os.getenv("CHROMA_DATABASE"),
         )
 
+        self._sparse_embedding_function = ChromaCloudSpladeEmbeddingFunction()
+
         schema = Schema()
         schema.create_index(
             config=SparseVectorIndexConfig(
                 source_key=K.DOCUMENT,
-                embedding_function=ChromaCloudSpladeEmbeddingFunction(),
+                embedding_function=self._sparse_embedding_function,
             ),
             key="sparse_embedding",
         )
@@ -33,9 +33,6 @@ class Embedding:
         self.collection = self.client.get_or_create_collection(
             name="rag_data",
             schema=schema,
-            embedding_function=SentenceTransformerEmbeddingFunction(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            ),
         )
 
     def upload_files(self, files, admin_id):

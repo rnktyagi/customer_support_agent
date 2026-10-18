@@ -8,6 +8,8 @@ import tiktoken
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
+from langgraph.runtime import Runtime
+from dataclasses import dataclass
 
 from typesafe_sdk import TypeSafeClient, Choice
 
@@ -59,9 +61,13 @@ encoder = tiktoken.get_encoding("o200k_base")
 
 CHUNK_TOKEN_LIMIT = 15000 
 
+@dataclass
+class KBContext:
+    admin_id: str
+
+
 class RAGWorkflowState(TypedDict):
     messages: List[AnyMessage]
-    admin_id: Optional[str]
     retrieved_context: Optional[str]
     retrieval_status: Optional[Literal["relevant", "irrelevant", "no_context"]]
     chunk_store: List[dict] 
@@ -71,8 +77,6 @@ class RAGWorkflowState(TypedDict):
     decision: Optional[Literal["retrieve", "reuse"]]
     retry_count: int
 
-
-# ---------- nodes ----------
 
 def preprocess_node(state: RAGWorkflowState) -> dict:
     messages = state.get("messages", [])
@@ -198,12 +202,12 @@ Rules:
     return {"rewritten_query": rewritten}
 
 
-async def retrieval_node(state: RAGWorkflowState) -> dict:
+async def retrieval_node(state: RAGWorkflowState, runtime: Runtime[KBContext]) -> dict:
     query = state.get("rewritten_query") or state.get("current_query", "")
 
-    admin_id = state.get("admin_id")
+    admin_id = runtime.context.admin_id
     if not admin_id:
-        print("Retrieval error: admin_id missing in state")
+        print("Retrieval error: admin_id missing in context")
         return {"new_chunks": []}
 
     retriever_inst = get_retriever()
@@ -362,7 +366,7 @@ def route_after_add(state: RAGWorkflowState) -> Literal["trim_oldest", "build_co
 
 
 def create_workflow_graph() -> StateGraph:
-    workflow = StateGraph(RAGWorkflowState)
+    workflow = StateGraph(RAGWorkflowState, context_schema=KBContext)
 
     workflow.add_node("preprocess", preprocess_node)
     workflow.add_node("context_sufficiency_gate", context_sufficiency_gate_node)

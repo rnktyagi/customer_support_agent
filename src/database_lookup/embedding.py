@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 import chromadb
 from chromadb import Schema, SparseVectorIndexConfig, K
 from chromadb.utils.embedding_functions import (
-    SentenceTransformerEmbeddingFunction,
     ChromaCloudSpladeEmbeddingFunction,
 )
 from src.database_lookup.scheme import Scheme
@@ -19,11 +18,13 @@ class SchemeEmbedding:
             database=os.getenv("CHROMA_DATABASE"),
         )
 
+        self._sparse_embedding_function = ChromaCloudSpladeEmbeddingFunction()
+
         schema = Schema()
         schema.create_index(
             config=SparseVectorIndexConfig(
                 source_key=K.DOCUMENT,
-                embedding_function=ChromaCloudSpladeEmbeddingFunction(),
+                embedding_function=self._sparse_embedding_function,
             ),
             key="sparse_embedding",
         )
@@ -31,9 +32,6 @@ class SchemeEmbedding:
         self.collection = self.client.get_or_create_collection(
             name="Text2SQL",
             schema=schema,
-            embedding_function=SentenceTransformerEmbeddingFunction(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            ),
         )
 
     def create_embeddings(self, connection_url: str, admin_id: str):

@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv
 import chromadb
 from chromadb import Search, K, Knn, Rrf
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from langchain_core.documents import Document
 
 load_dotenv()
 
@@ -13,12 +13,7 @@ class SchemeRetriever:
             tenant=os.getenv("CHROMA_TENANT"),
             database=os.getenv("CHROMA_DATABASE"),
         )
-        self.collection = self.client.get_collection(
-            name="Text2SQL",
-            embedding_function=SentenceTransformerEmbeddingFunction(
-                model_name="sentence-transformers/all-MiniLM-L6-v2"
-            ),
-        )
+        self.collection = self.client.get_collection(name="Text2SQL")
 
     def retrieve(self, query, admin_id, top_k=5):
         hybrid_rank = Rrf(
@@ -40,9 +35,9 @@ class SchemeRetriever:
 
         rows = self.collection.search(search).rows()[0]
         if not rows:
-            return ""
+            return []
 
-        dialect = rows[0]["metadata"]["dialect"]
-        tables = "\n".join(row["metadata"]["table_info"] for row in rows)
-
-        return f"Dialect : {dialect}\n{tables}\n"
+        return [
+            Document(page_content=row["metadata"]["table_info"], metadata=row["metadata"])
+            for row in rows
+        ]
