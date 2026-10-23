@@ -58,7 +58,7 @@ MAX_ROWS = 50
 
 
 @dataclass
-class DBLookupContext:
+class AgentContext:
     admin_id: str
     user_id: str
     engine: Engine
@@ -221,7 +221,7 @@ Rules:
     return {"rewritten_query": rewritten}
 
 
-async def retrieval_node(state: DBLookupState, runtime: Runtime[DBLookupContext]) -> dict:
+async def retrieval_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     query = state.get("rewritten_query") or state.get("current_query", "")
     admin_id = runtime.context.admin_id
 
@@ -458,7 +458,7 @@ Generated SQL:
     return {"sql_query": sql, "sql_error": None}
 
 
-def sql_execution_node(state: DBLookupState, runtime: Runtime[DBLookupContext]) -> dict:
+def sql_execution_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     sql = state.get("sql_query", "")
     context = runtime.context
 
@@ -524,7 +524,7 @@ def route_after_execution(state: DBLookupState) -> Literal["broaden_query", "fal
 
 
 def create_db_lookup_graph() -> StateGraph:
-    workflow = StateGraph(DBLookupState, context_schema=DBLookupContext)
+    workflow = StateGraph(DBLookupState, context_schema=AgentContext)
 
     workflow.add_node("preprocess", preprocess_node)
     workflow.add_node("context_sufficiency_gate", context_sufficiency_gate_node)
@@ -616,4 +616,3 @@ def build_agent():
 
 
 build_workflow = build_agent
-

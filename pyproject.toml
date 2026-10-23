@@ -7,6 +7,9 @@ requires-python = ">=3.14"
 dependencies = [
     "chromadb>=1.5.9",
     "docling>=2.130.0",
+    "fastapi>=0.115.0",
+    "python-multipart>=0.0.12",
+    "uvicorn>=0.30.0",
     "fastembed>=0.8.1",
     "langchain>=1.4.2",
     "langchain-chroma>=1.1.0",
@@ -18,5 +21,6 @@ dependencies = [
     "langgraph>=1.2.12",
     "python-dotenv>=1.2.3",
     "sentence-transformers>=6.1.0",
+    "supabase>=2.33.0",
     "typesafe-sdk>=0.7.1",
 ]

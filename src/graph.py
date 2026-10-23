@@ -3,12 +3,11 @@ from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated, List, Literal, Optional
 from langgraph.graph.message import add_messages
-from langchain_core.messages import AnyMessage, HumanMessage, AIMessage
-from typesafe_sdk import TypeSafeClient, Choice, Noul, Score
+from langchain_core.messages import AnyMessage, AIMessage
+from typesafe_sdk import TypeSafeClient, Choice,Score
 
-from src.agents.knowledge_base_agent import build_agent as build_kb_agent
-from src.agents.database_lookup_agent import build_agent as build_db_agent, DBLookupContext
-from src.agents.knowledge_base_agent import KBContext
+from src.agents.knowledge_base_agent import build_agent as build_kb_agent, KBContext
+from src.agents.database_lookup_agent import build_agent as build_db_agent, AgentContext
 import json
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -102,7 +101,7 @@ def route_after_router(state: State) -> Literal["knowledge_base", "database_look
     return "knowledge_base"
 
 
-async def database_lookup_node(state: State, runtime: Runtime[DBLookupContext], config: RunnableConfig) -> dict:
+async def database_lookup_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
     result = await db_subgraph.ainvoke(
         {"messages": state["messages"]},
         config,
@@ -111,7 +110,7 @@ async def database_lookup_node(state: State, runtime: Runtime[DBLookupContext], 
     return {"db_rows": result.get("db_rows", []), "db_status": result.get("db_status")}
 
 
-async def knowledge_base_node(state: State, runtime: Runtime[DBLookupContext], config: RunnableConfig) -> dict:
+async def knowledge_base_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
     result = await kb_subgraph.ainvoke(
         {"messages": state["messages"]},
         config,
@@ -134,6 +133,7 @@ async def answer_node(state: State) -> dict:
             return {"messages": [AIMessage(content="I couldn't find anything about that in the company's documents.")]}
         source = f"<documents>{context}</documents>"
 
+    messages = state.get("messages")
     response = await answer_llm.ainvoke([
         SystemMessage(content=(
             "You are a customer support assistant. Answer the user's latest question using only the "
@@ -141,7 +141,7 @@ async def answer_node(state: State) -> dict:
             "Do not invent values. Mention the source and page when it helps.\n\n"
             f"{source}"
         )),
-        *state["messages"],
+        *messages,
     ])
     return {"messages": [AIMessage(content=response.content)]}
 
@@ -161,27 +161,17 @@ def get_supabase() -> Client:
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
 
-async def human_escalate_node(state: State, runtime: Runtime[DBLookupContext], config: RunnableConfig) -> dict:
-    messages = state["messages"]
+async def human_escalate_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
+    messages = state.get("messages")
 
-    try:
-        draft = await ticket_llm.ainvoke([
-            SystemMessage(content=(
-                "You create support tickets. From the conversation, write a short subject, a clear "
-                "description of the customer's issue and what they need, a category, and a priority "
-                "based on urgency, frustration, and any security or financial risk."
-            )),
-            *messages,
-        ])
-    except Exception as e:
-        print(f"Ticket drafting error: {e}. Using the customer's last message")
-        query = str(messages[-1].content)
-        draft = TicketDraft(
-            subject=query[:120],
-            description=query,
-            category="other",
-            priority=state.get("urgency") or "medium",
-        )
+    draft = await ticket_llm.ainvoke([
+        SystemMessage(content=(
+            "You create support tickets. From the conversation, write a short subject, a clear "
+            "description of the customer's issue and what they need, a category, and a priority "
+            "based on urgency, frustration, and any security or financial risk."
+        )),
+        *messages,
+    ])
 
     ticket = {
         "user_id": runtime.context.user_id,
@@ -208,7 +198,7 @@ def irrelevant_node(state: State) -> dict:
 
 
 def create_graph() -> StateGraph:
-    workflow = StateGraph(State, context_schema=DBLookupContext)
+    workflow = StateGraph(State, context_schema=AgentContext)
 
     workflow.add_node("router", routing_decision_node)
     workflow.add_node("knowledge_base", knowledge_base_node)
