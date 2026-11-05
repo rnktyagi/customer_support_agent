@@ -66,15 +66,17 @@ async def user_signup(body: CustomerSignup, request: Request):
     ).maybe_single().execute()
     if admin is None or admin.data is None:
         raise HTTPException(status_code=400, detail="Invalid admin code.")
+    admin_id = admin.data["id"]
 
     try:
         result = await request.app.state.supabase_auth.auth.sign_up(
             {"email": body.email, "password": body.password}
         )
         await request.app.state.supabase.table("customers").insert(
-            {"user_id": result.user.id, "admin_id": admin.data[0]["id"]}
+            {"user_id": result.user.id, "admin_id": admin_id}
         ).execute()
     except Exception as e:
+        print(f"User signup error: {e}")
         raise HTTPException(status_code=400, detail=str(e))
     return {"message": "Sign up successful. Confirm your email if asked, then sign in."}
 

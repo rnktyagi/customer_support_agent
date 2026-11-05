@@ -26,28 +26,24 @@ class UploadDBRequest(BaseModel):
 @router.post("/database", response_model=UploadDBResponse)
 async def upload_database(
     request: Request,
-    admin_id: str = Form(...),
-    database_url: str = Form(...),
-    identity_table: str = Form(...),
-    pk_column: str = Form(...),
-    email_column: str = Form(...),
+    body: UploadDBRequest,
 ):
     supabase = request.app.state.supabase
 
-    admin = await supabase.table("admins").select("id").eq("id", admin_id).maybe_single().execute()
+    admin = await supabase.table("admins").select("id").eq("id", body.admin_id).maybe_single().execute()
     if admin is None or admin.data is None:
         raise HTTPException(status_code=403, detail="Invalid admin_id.")
 
     await supabase.table("admins").update({
-        "database_url": database_url,
-        "identity_table": identity_table,
-        "pk_column": pk_column,
-        "email_column": email_column,
-    }).eq("id", admin_id).execute()
+        "database_url": body.database_url,
+        "identity_table": body.identity_table,
+        "pk_column": body.pk_column,
+        "email_column": body.email_column,
+    }).eq("id", body.admin_id).execute()
 
     try:
         ids = await asyncio.to_thread(
-            request.app.state.scheme_embedding.create_embeddings, database_url, admin_id
+            request.app.state.scheme_embedding.create_embeddings, body.database_url, body.admin_id
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

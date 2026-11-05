@@ -11,11 +11,12 @@ def api_post(endpoint, data=None, files=None, token=None):
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    timeout = 300 if endpoint.startswith("/upload") or endpoint.startswith("/chat") else 30
     try:
         if files:
-            r = requests.post(f"{BACKEND}{endpoint}", data=data, files=files, headers=headers, timeout=30)
+            r = requests.post(f"{BACKEND}{endpoint}", data=data, files=files, headers=headers, timeout=timeout)
         else:
-            r = requests.post(f"{BACKEND}{endpoint}", json=data, headers=headers, timeout=30)
+            r = requests.post(f"{BACKEND}{endpoint}", json=data, headers=headers, timeout=timeout)
         r.raise_for_status()
         return r.json()
     except Exception as e:
