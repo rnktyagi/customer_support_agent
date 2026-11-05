@@ -15,11 +15,22 @@ class UploadKBResponse(BaseModel):
     chunk_ids: List[str]
 
 
+class UploadDBRequest(BaseModel):
+    admin_id: str
+    database_url: str
+    identity_table: str
+    pk_column: str
+    email_column: str
+
+
 @router.post("/database", response_model=UploadDBResponse)
 async def upload_database(
     request: Request,
     admin_id: str = Form(...),
     database_url: str = Form(...),
+    identity_table: str = Form(...),
+    pk_column: str = Form(...),
+    email_column: str = Form(...),
 ):
     supabase = request.app.state.supabase
 
@@ -27,9 +38,12 @@ async def upload_database(
     if admin is None or admin.data is None:
         raise HTTPException(status_code=403, detail="Invalid admin_id.")
 
-    await supabase.table("admins").update({"database_url": database_url}).eq(
-        "id", admin_id
-    ).execute()
+    await supabase.table("admins").update({
+        "database_url": database_url,
+        "identity_table": identity_table,
+        "pk_column": pk_column,
+        "email_column": email_column,
+    }).eq("id", admin_id).execute()
 
     try:
         ids = await asyncio.to_thread(

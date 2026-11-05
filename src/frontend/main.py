@@ -29,6 +29,9 @@ def init_state():
         "role": None,
         "admin_id": None,
         "admin_code": None,
+        "identity_table": None,
+        "pk_column": None,
+        "email_column": None,
         "access_token": None,
         "thread_id": None,
         "messages": [],
@@ -163,6 +166,9 @@ def signin_form():
                         st.session_state.admin_id = r["admin_id"]
                         st.session_state.admin_code = r["admin_code"]
                         st.session_state.database_url = r.get("database_url")
+                        st.session_state.identity_table = r.get("identity_table")
+                        st.session_state.pk_column = r.get("pk_column")
+                        st.session_state.email_column = r.get("email_column")
                         go("admin_dashboard")
                 else:
                     r = api_post("/auth/user/signin", {"email": email, "password": password})
@@ -192,7 +198,7 @@ def admin_dashboard():
         st.write(f"Admin ID: `{st.session_state.admin_id}`")
     with col3:
         if st.button("Logout", use_container_width=True):
-            for k in ["admin_id", "user_id", "admin_code", "thread_id", "messages", "role"]:
+            for k in ["admin_id", "user_id", "admin_code", "identity_table", "pk_column", "email_column", "thread_id", "messages", "role"]:
                 st.session_state[k] = None if k != "messages" else []
             st.session_state.page = "landing"
             st.rerun()
@@ -212,16 +218,34 @@ def admin_dashboard():
         url = st.text_input("Database URL",
                             value=db_url or "",
                             placeholder="postgresql://user:pass@host:5432/dbname")
+        identity_table = st.text_input("Customer Table",
+                                       value=st.session_state.get("identity_table", "customers"),
+                                       placeholder="customers")
+        pk_column = st.text_input("Primary Key Column",
+                                  value=st.session_state.get("pk_column", "customer_id"),
+                                  placeholder="customer_id")
+        email_column = st.text_input("Email Column",
+                                     value=st.session_state.get("email_column", "email"),
+                                     placeholder="email")
         if st.form_submit_button("Save & Index Schema", use_container_width=True):
             if not url:
                 st.error("Please enter a database URL")
             else:
                 with st.spinner("Saving and indexing..."):
-                    r = api_post("/upload/database", {"admin_id": st.session_state.admin_id, "database_url": url})
+                    r = api_post("/upload/database", {
+                        "admin_id": st.session_state.admin_id,
+                        "database_url": url,
+                        "identity_table": identity_table,
+                        "pk_column": pk_column,
+                        "email_column": email_column,
+                    })
                     if "error" in r:
                         st.error(r["error"])
                     else:
                         st.session_state.database_url = url
+                        st.session_state.identity_table = identity_table
+                        st.session_state.pk_column = pk_column
+                        st.session_state.email_column = email_column
                         st.success(f"Indexed {len(r['table_ids'])} tables")
 
     # Knowledge base upload
@@ -262,7 +286,7 @@ def customer_chat():
             st.rerun()
     with col3:
         if st.button("Logout", use_container_width=True):
-            for k in ["admin_id", "user_id", "admin_code", "thread_id", "messages", "role"]:
+            for k in ["admin_id", "user_id", "admin_code", "identity_table", "pk_column", "email_column", "thread_id", "messages", "role"]:
                 st.session_state[k] = None if k != "messages" else []
             st.session_state.page = "landing"
             st.rerun()

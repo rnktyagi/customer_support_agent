@@ -43,7 +43,7 @@ async def admin_signin(body: Credentials, request: Request):
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    admin = await request.app.state.supabase.table("admins").select("id, code, database_url").eq(
+    admin = await request.app.state.supabase.table("admins").select("id, code, database_url, identity_table, pk_column, email_column").eq(
         "user_id", result.user.id
     ).maybe_single().execute()
     if admin is None or admin.data is None:
@@ -53,6 +53,9 @@ async def admin_signin(body: Credentials, request: Request):
         "admin_id": admin.data["id"],
         "admin_code": admin.data["code"],
         "database_url": admin.data.get("database_url"),
+        "identity_table": admin.data.get("identity_table"),
+        "pk_column": admin.data.get("pk_column"),
+        "email_column": admin.data.get("email_column"),
     }
 
 

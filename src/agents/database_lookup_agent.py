@@ -61,6 +61,7 @@ MAX_ROWS = 50
 class AgentContext:
     admin_id: str
     user_id: str
+    tenant_pk_column: str
     engine: Engine
 
 
@@ -352,13 +353,14 @@ def build_schema_node(state: DBLookupState) -> dict:
     return {"schema": f"Dialect : {dialect}\n{tables}\n"}
 
 
-def sql_generator_node(state: DBLookupState) -> dict:
+def sql_generator_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     schema = state.get("schema", "")
     question = state.get("current_query", "")
     standalone_question = state.get("rewritten_query", "")
     previous_sql = state.get("sql_query")
     error = state.get("sql_error")
     sql_retry_count = state.get("sql_retry_count", 0)
+    pk_column = runtime.context.tenant_pk_column
 
     system_instruction = f"""You are an enterprise Text-to-SQL generator. Write ONE read-only SQL query that answers the user's question from the given database schema.
 
@@ -368,7 +370,7 @@ Rules:
 1. The query must only GET data: a single SELECT statement (a WITH clause is allowed). Never write anything that deletes or manipulates data or the schema.
 2. Use ONLY the tables and columns present in the given schema, with their exact names. Never hallucinate a column, table or join.
 3. Write the query in the exact SQL dialect stated in the schema (the "Dialect : ..." line). Do not default to another dialect's syntax.
-4. The current user's id is available as the bind parameter :user_id. Every query MUST restrict the results to this user with :user_id, either on the user's column directly or through joins. Never write a literal user id and never return other users' data.
+4. The current customer's records are identified by the column "{pk_column}". Every query MUST restrict the results to this customer using the bind parameter :tenant_user_pk on that exact column. Example: WHERE {pk_column} = :tenant_user_pk. Never write a literal customer id and never return other customers' data.
 5. For every selected column, use a clear alias (e.g. SUM(amount) AS total_amount) so the result can be understood without guessing from column position.
 6. When the question is about a person, customer, company, product or other entity, return BOTH its readable name field (if one exists) and its matching ID field, joining to another table to fetch the name if needed. Priority: (1) name and id together, (2) name only if the id cannot be included, (3) id only if no readable name exists anywhere.
 7. When listing records, also include the other relevant identifying columns available in the schema (for example id, name and designation for an employee).
@@ -420,8 +422,8 @@ def sql_guard_node(state: DBLookupState) -> dict:
         return {"sql_error": "Only one statement is allowed."}
     if re.search(r"\b(insert|update|delete|drop|alter|truncate|create|grant|revoke|merge)\b", lowered):
         return {"sql_error": "The query contains a write or schema-changing keyword."}
-    if ":user_id" not in sql:
-        return {"sql_error": "The query must restrict the data to the current user with the :user_id parameter."}
+    if ":tenant_user_pk" not in sql:
+        return {"sql_error": "The query must restrict the data to the current customer with the :tenant_user_pk parameter."}
 
     prompt_state = f"""User Question:
 {question}
@@ -439,10 +441,10 @@ Generated SQL:
             state=prompt_state,
             questions={
                 "safety": Choice(
-                    instructions="Is the generated SQL safe to run for the current user? It must only read data, only touch data belonging to the current user via :user_id, and must not read system tables or other users' data.",
+                    instructions="Is the generated SQL safe to run for the current customer? It must only read data, only touch data belonging to the current customer via :tenant_user_pk, and must not read system tables or other customers' data.",
                     criteria={
-                        "safe": "Read-only query that is properly restricted to the current user with :user_id on the right column, directly or through joins.",
-                        "unsafe": "Writes or changes data, reads system or schema tables, is not restricted to the current user, or could expose other users' data."
+                        "safe": "Read-only query that is properly restricted to the current customer with :tenant_user_pk on the right column, directly or through joins.",
+                        "unsafe": "Writes or changes data, reads system or schema tables, is not restricted to the current customer, or could expose other customers' data."
                     }
                 )
             }
@@ -453,7 +455,7 @@ Generated SQL:
         verdict = "unsafe"
 
     if verdict != "safe":
-        return {"sql_error": "The query was rejected by the safety check. Make sure it is read-only and restricted to the current user with :user_id on the correct column."}
+        return {"sql_error": "The query was rejected by the safety check. Make sure it is read-only and restricted to the current customer with :tenant_user_pk on the correct column."}
 
     return {"sql_query": sql, "sql_error": None}
 
@@ -464,7 +466,7 @@ def sql_execution_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> 
 
     try:
         with context.engine.connect() as conn:
-            result = conn.execute(text(sql), {"user_id": context.user_id})
+            result = conn.execute(text(sql), {"tenant_user_pk": context.user_id})
             rows = result.mappings().fetchmany(MAX_ROWS)
 
         db_rows = [
