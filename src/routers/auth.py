@@ -17,13 +17,13 @@ class CustomerSignup(BaseModel):
 
 
 @router.post("/admin/signup")
-def admin_signup(body: Credentials, request: Request):
+async def admin_signup(body: Credentials, request: Request):
     code = secrets.token_hex(4).upper()
     try:
-        result = request.app.state.supabase_auth.auth.sign_up(
+        result = await request.app.state.supabase_auth.auth.sign_up(
             {"email": body.email, "password": body.password}
         )
-        request.app.state.supabase.table("admins").insert(
+        await request.app.state.supabase.table("admins").insert(
             {"user_id": result.user.id, "code": code}
         ).execute()
     except Exception as e:
@@ -35,40 +35,40 @@ def admin_signup(body: Credentials, request: Request):
 
 
 @router.post("/admin/signin")
-def admin_signin(body: Credentials, request: Request):
+async def admin_signin(body: Credentials, request: Request):
     try:
-        result = request.app.state.supabase_auth.auth.sign_in_with_password(
+        result = await request.app.state.supabase_auth.auth.sign_in_with_password(
             {"email": body.email, "password": body.password}
         )
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    admin = request.app.state.supabase.table("admins").select("id, code").eq(
+    admin = await request.app.state.supabase.table("admins").select("id, code, database_url").eq(
         "user_id", result.user.id
-    ).execute()
-    if not admin.data:
+    ).maybe_single().execute()
+    if admin is None or admin.data is None:
         raise HTTPException(status_code=403, detail="This is not an admin account.")
 
     return {
-        "access_token": result.session.access_token,
-        "refresh_token": result.session.refresh_token,
-        "admin_code": admin.data[0]["code"],
+        "admin_id": admin.data["id"],
+        "admin_code": admin.data["code"],
+        "database_url": admin.data.get("database_url"),
     }
 
 
 @router.post("/user/signup")
-def user_signup(body: CustomerSignup, request: Request):
-    admin = request.app.state.supabase.table("admins").select("id").eq(
+async def user_signup(body: CustomerSignup, request: Request):
+    admin = await request.app.state.supabase.table("admins").select("id").eq(
         "code", body.admin_code.strip().upper()
-    ).execute()
-    if not admin.data:
+    ).maybe_single().execute()
+    if admin is None or admin.data is None:
         raise HTTPException(status_code=400, detail="Invalid admin code.")
 
     try:
-        result = request.app.state.supabase_auth.auth.sign_up(
+        result = await request.app.state.supabase_auth.auth.sign_up(
             {"email": body.email, "password": body.password}
         )
-        request.app.state.supabase.table("customers").insert(
+        await request.app.state.supabase.table("customers").insert(
             {"user_id": result.user.id, "admin_id": admin.data[0]["id"]}
         ).execute()
     except Exception as e:
@@ -77,20 +77,21 @@ def user_signup(body: CustomerSignup, request: Request):
 
 
 @router.post("/user/signin")
-def user_signin(body: Credentials, request: Request):
+async def user_signin(body: Credentials, request: Request):
     try:
-        result = request.app.state.supabase_auth.auth.sign_in_with_password(
+        result = await request.app.state.supabase_auth.auth.sign_in_with_password(
             {"email": body.email, "password": body.password}
         )
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    customer = request.app.state.supabase.table("customers").select("admin_id").eq(
+    customer = await request.app.state.supabase.table("customers").select("admin_id").eq(
         "user_id", result.user.id
-    ).execute()
-    if not customer.data:
+    ).maybe_single().execute()
+    if customer is None or customer.data is None:
         raise HTTPException(status_code=403, detail="This is not a user account.")
 
     return {
-        "admin_id": customer.data[0]["admin_id"]
+        "admin_id": customer.data["admin_id"],
+        "access_token": result.session.access_token,
     }
