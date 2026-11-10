@@ -243,6 +243,15 @@ async def retrieval_node(state: DBLookupState, runtime: Runtime[AgentContext]) -
         }
         for doc in results
     ]
+    
+    capped, budget = [], 0
+    for table in new_tables:
+        if capped and budget + table["tokens"] > TABLE_TOKEN_LIMIT:
+            break
+        capped.append(table)
+        budget += table["tokens"]
+    new_tables = capped
+
     return {"new_tables": new_tables}
 
 

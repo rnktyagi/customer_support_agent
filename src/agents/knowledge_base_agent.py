@@ -224,6 +224,15 @@ async def retrieval_node(state: RAGWorkflowState, runtime: Runtime[KBContext]) -
         }
         for chunk in results
     ]
+
+    capped, budget = [], 0
+    for chunk in new_chunks:
+        if capped and budget + chunk["tokens"] > CHUNK_TOKEN_LIMIT:
+            break
+        capped.append(chunk)
+        budget += chunk["tokens"]
+    new_chunks = capped
+
     return {"new_chunks": new_chunks}
 
 
