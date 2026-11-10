@@ -40,9 +40,28 @@ class State(TypedDict) :
     route: Optional[Literal["knowledge_base", "database_lookup", "human_escalate", "Irrelevant"]]
     urgency: Optional[Literal["low", "medium", "high"]]
     urgency_score: Optional[int]
+    sources: Optional[List[Literal["knowledge_base", "database_lookup"]]]
     retrieved_context: Optional[str]
     db_rows: List[dict]
     db_status: Optional[Literal["ok", "failed"]]
+
+
+# A retrieval source is included when JEV assigns it at least this much probability.
+# Below the threshold the query is treated as single-source.
+ROUTE_PROB_THRESHOLD = 0.65
+
+
+def decide_sources(probs) -> List[str]:
+    """Return the set of retrieval sources JEV assigns meaningful probability to."""
+    sources = []
+    for label in ("knowledge_base", "database_lookup"):
+        if (probs.get(label) or 0.0) >= ROUTE_PROB_THRESHOLD:
+            sources.append(label)
+    if not sources:
+        winner = max(probs, key=lambda k: probs[k]) if probs else None
+        if winner in ("knowledge_base", "database_lookup"):
+            sources = [winner]
+    return sources
 
 def routing_decision_node(state : State) :
     messages = state.get("messages")
@@ -86,21 +105,24 @@ According to the given user query, you have to decide between the given 4 differ
         route=response.answers['route'].choice
         urgency_score=response.answers['urgency'].score
         urgency = {0: "low", 1: "medium", 2: "high"}.get(urgency_score)
-        return {"route" : route , "urgency" : urgency, "urgency_score" : urgency_score}
+        sources = decide_sources(response.answers['route'].probabilities)
+        return {"route" : route , "urgency" : urgency, "urgency_score" : urgency_score, "sources" : sources}
     except Exception as e :
         print(f"{e}")
         return {"route": None, "urgency": None}
 
 
-def route_after_router(state: State) -> Literal["knowledge_base", "database_lookup", "human_escalate", "irrelevant"]:
-    route = state.get("route")
+def route_after_router(state: State) -> Literal["knowledge_base", "database_lookup", "both_sources", "human_escalate", "irrelevant"]:
     if state.get("urgency") == "high":
         return "human_escalate"
-    if route == "database_lookup":
+    sources = state.get("sources") or []
+    if len(sources) == 2:
+        return "both_sources"
+    if state.get("route") == "database_lookup":
         return "database_lookup"
-    if route == "human_escalate":
+    if state.get("route") == "human_escalate":
         return "human_escalate"
-    if route == "Irrelevant":
+    if state.get("route") == "Irrelevant":
         return "irrelevant"
     return "knowledge_base"
 
@@ -123,19 +145,53 @@ async def knowledge_base_node(state: State, runtime: Runtime[AgentContext], conf
     return {"retrieved_context": result.get("retrieved_context")}
 
 
+async def both_sources_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
+    """Run the KB and DB subgraphs sequentially and merge their results.
+
+    Sequential (not parallel) on purpose: both subgraphs use per-thread
+    checkpointers, so invoking them concurrently under the same thread_id
+    would cause checkpoint namespace conflicts.
+    """
+    kb_result = await kb_subgraph.ainvoke(
+        {"messages": state["messages"]},
+        config,
+        context=KBContext(admin_id=runtime.context.admin_id),
+    )
+    db_result = await db_subgraph.ainvoke(
+        {"messages": state["messages"]},
+        config,
+        context=runtime.context,
+    )
+    return {
+        "retrieved_context": kb_result.get("retrieved_context"),
+        "db_rows": db_result.get("db_rows", []),
+        "db_status": db_result.get("db_status"),
+    }
+
+
 async def answer_node(state: State) -> dict:
-    if state.get("route") == "database_lookup":
-        rows = state.get("db_rows") or []
-        if state.get("db_status") != "ok":
-            return {"messages": [AIMessage(content="I couldn't retrieve that information right now. Please try again or rephrase your request.")]}
-        if not rows:
-            return {"messages": [AIMessage(content="I couldn't find any matching records for your account.")]}
-        source = f"<database_rows>{json.dumps(rows)}</database_rows>"
-    else:
-        context = (state.get("retrieved_context") or "").strip()
-        if not context:
-            return {"messages": [AIMessage(content="I couldn't find anything about that in the company's documents.")]}
-        source = f"<documents>{context}</documents>"
+    sources = state.get("sources") or []
+    has_kb = "knowledge_base" in sources
+    has_db = "database_lookup" in sources
+
+    db_rows = state.get("db_rows") or []
+    db_ok = state.get("db_status") == "ok"
+    context = (state.get("retrieved_context") or "").strip()
+
+    # Neither source produced anything usable.
+    if not has_kb and not has_db:
+        return {"messages": [AIMessage(content="I couldn't find any information to answer that. Please try rephrasing.")]}
+    if has_kb and not context:
+        return {"messages": [AIMessage(content="I couldn't find anything about that in the company's documents.")]}
+    if has_db and (not db_ok or not db_rows):
+        return {"messages": [AIMessage(content="I couldn't retrieve that information right now. Please try again or rephrase your request.")]}
+
+    parts = []
+    if has_kb:
+        parts.append(f"<documents>{context}</documents>")
+    if has_db:
+        parts.append(f"<database_rows>{json.dumps(db_rows)}</database_rows>")
+    source = "\n".join(parts)
 
     messages = state.get("messages")
     response = await answer_llm.ainvoke([
@@ -208,6 +264,7 @@ def create_graph() -> StateGraph:
     workflow.add_node("knowledge_base", knowledge_base_node)
     workflow.add_node("answer", answer_node)
     workflow.add_node("database_lookup", database_lookup_node)
+    workflow.add_node("both_sources", both_sources_node)
     workflow.add_node("human_escalate", human_escalate_node)
     workflow.add_node("irrelevant", irrelevant_node)
 
@@ -219,6 +276,7 @@ def create_graph() -> StateGraph:
         {
             "knowledge_base": "knowledge_base",
             "database_lookup": "database_lookup",
+            "both_sources": "both_sources",
             "human_escalate": "human_escalate",
             "irrelevant": "irrelevant",
         }
@@ -226,6 +284,7 @@ def create_graph() -> StateGraph:
 
     workflow.add_edge("knowledge_base", "answer")
     workflow.add_edge("database_lookup", "answer")
+    workflow.add_edge("both_sources", "answer")
     workflow.add_edge("answer", END)
     workflow.add_edge("human_escalate", END)
     workflow.add_edge("irrelevant", END)
