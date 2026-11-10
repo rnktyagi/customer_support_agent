@@ -39,6 +39,7 @@ class State(TypedDict) :
     messages : Annotated[List[AnyMessage], add_messages]
     route: Optional[Literal["knowledge_base", "database_lookup", "human_escalate", "Irrelevant"]]
     urgency: Optional[Literal["low", "medium", "high"]]
+    urgency_score: Optional[int]
     retrieved_context: Optional[str]
     db_rows: List[dict]
     db_status: Optional[Literal["ok", "failed"]]
@@ -83,8 +84,9 @@ According to the given user query, you have to decide between the given 4 differ
             }
         )
         route=response.answers['route'].choice
-        urgency=response.answers['urgency'].score
-        return {"route" : route , "urgency" : urgency}
+        urgency_score=response.answers['urgency'].score
+        urgency = {0: "low", 1: "medium", 2: "high"}.get(urgency_score)
+        return {"route" : route , "urgency" : urgency, "urgency_score" : urgency_score}
     except Exception as e :
         print(f"{e}")
         return {"route": None, "urgency": None}
@@ -92,6 +94,8 @@ According to the given user query, you have to decide between the given 4 differ
 
 def route_after_router(state: State) -> Literal["knowledge_base", "database_lookup", "human_escalate", "irrelevant"]:
     route = state.get("route")
+    if state.get("urgency") == "high":
+        return "human_escalate"
     if route == "database_lookup":
         return "database_lookup"
     if route == "human_escalate":
