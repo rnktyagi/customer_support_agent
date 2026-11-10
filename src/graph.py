@@ -2,9 +2,11 @@ import os
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
 from typing import TypedDict, Annotated, List, Literal, Optional
-from langgraph.graph.message import add_messages
-from langchain_core.messages import AnyMessage, AIMessage
+from langgraph.graph.message import add_messages, RemoveMessage
+from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
+from langgraph.types import Command
 from typesafe_sdk import TypeSafeClient, Choice,Score
+import tiktoken
 
 from src.agents.knowledge_base_agent import build_agent as build_kb_agent, KBContext
 from src.agents.database_lookup_agent import build_agent as build_db_agent, AgentContext
@@ -34,6 +36,63 @@ answer_llm = ChatOpenAI(
     openai_api_base="https://api.groq.com/openai/v1",
     temperature=0,
 )
+
+# Summarizes conversation history when it grows past SUMMARY_TOKEN_LIMIT.
+# The conversation (not the chunk/table store) is the only unbounded context in
+# this system, so summarization lives here in the parent graph, once.
+summarizer_llm = ChatOpenAI(
+    model="llama-3.1-8b-instant",
+    openai_api_key=os.getenv("GROQ_API_KEY"),
+    openai_api_base="https://api.groq.com/openai/v1",
+    temperature=0,
+)
+
+SUMMARY_TOKEN_LIMIT = 4000
+# Messages kept verbatim (recent turns carry the most nuance).
+SUMMARY_KEEP_LAST = 2
+
+
+_encoder = tiktoken.get_encoding("o200k_base")
+
+
+def _message_tokens(messages) -> int:
+    """Token estimate for the conversation history."""
+    return sum(len(_encoder.encode(str(m.content))) for m in messages)
+
+
+def summarize_history_node(state: State) -> Command:
+    """Replace older turns with a compact summary, keeping the last turns raw.
+
+    Must return a Command with RemoveMessage entries: the messages reducer
+    appends on a plain dict return, so returning a new list would only add to
+    the history instead of replacing it.
+    """
+    messages = state.get("messages") or []
+    if len(messages) <= SUMMARY_KEEP_LAST:
+        return Command(update={"messages": []})
+
+    to_summarize, keep = messages[:-SUMMARY_KEEP_LAST], messages[-SUMMARY_KEEP_LAST:]
+
+    summary = summarizer_llm.invoke([
+        SystemMessage(content=(
+            "Summarize the conversation so far for a customer support agent. "
+            "Preserve the customer's issue, any account/order details, what was "
+            "decided, and any open questions. Be concise but complete."
+        )),
+        *to_summarize,
+    ]).content
+
+    return Command(update={
+        "messages": [RemoveMessage(id=m.id) for m in to_summarize]
+                     + [AIMessage(content=summary)],
+    })
+
+
+def route_before_router(state: State) -> str:
+    """Summarize only when the conversation actually exceeds the budget."""
+    if _message_tokens(state.get("messages") or []) > SUMMARY_TOKEN_LIMIT:
+        return "summarize"
+    return "router"
 
 class State(TypedDict) :
     messages : Annotated[List[AnyMessage], add_messages]
@@ -197,10 +256,11 @@ async def answer_node(state: State) -> dict:
     response = await answer_llm.ainvoke([
         SystemMessage(content=(
             "You are a customer support assistant. Answer the user's latest question using only the "
-            "information below. If it does not contain the answer, say you could not find it. "
-            "Do not invent values. Mention the source and page when it helps.\n\n"
-            f"{source}"
+            "information in the <context> block below. If it does not contain the answer, say you "
+            "could not find it. Do not invent values. Mention the source and page when it helps."
         )),
+        
+        HumanMessage(content=f"<context>\n{source}\n</context>"),
         *messages,
     ])
     return {"messages": [AIMessage(content=response.content)]}
@@ -210,7 +270,8 @@ class TicketDraft(BaseModel):
     subject: str = Field(description="Short title of the issue, at most 120 characters")
     description: str = Field(description="Clear summary of the customer's issue and what they need, based on the conversation")
     category: Literal["billing", "technical", "account", "other"]
-    priority: Literal["low", "medium", "high"]
+    # Optional: priority is set by the router's urgency assessment, not the LLM.
+    priority: Optional[Literal["low", "medium", "high"]] = None
 
 
 ticket_llm = answer_llm.with_structured_output(TicketDraft)
@@ -223,12 +284,13 @@ def get_supabase() -> Client:
 
 async def human_escalate_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
     messages = state.get("messages")
+    priority = state.get("urgency") or "medium"
 
     draft = await ticket_llm.ainvoke([
         SystemMessage(content=(
             "You create support tickets. From the conversation, write a short subject, a clear "
-            "description of the customer's issue and what they need, a category, and a priority "
-            "based on urgency, frustration, and any security or financial risk."
+            "description of the customer's issue and what they need, and a category "
+            "(billing, technical, account, or other). Do not set a priority."
         )),
         *messages,
     ])
@@ -238,6 +300,7 @@ async def human_escalate_node(state: State, runtime: Runtime[AgentContext], conf
         "admin_id": runtime.context.admin_id,
         "thread_id": config["configurable"]["thread_id"],
         **draft.model_dump(),
+        "priority": priority,   # router's urgency is authoritative; placed last so it wins
     }
 
     try:
@@ -267,8 +330,16 @@ def create_graph() -> StateGraph:
     workflow.add_node("both_sources", both_sources_node)
     workflow.add_node("human_escalate", human_escalate_node)
     workflow.add_node("irrelevant", irrelevant_node)
+    workflow.add_node("summarize", summarize_history_node)
 
-    workflow.add_edge(START, "router")
+    workflow.add_conditional_edges(
+        START,
+        route_before_router,
+        {
+            "summarize": "summarize",
+            "router": "router",
+        }
+    )
 
     workflow.add_conditional_edges(
         "router",
@@ -282,6 +353,7 @@ def create_graph() -> StateGraph:
         }
     )
 
+    workflow.add_edge("summarize", "router")
     workflow.add_edge("knowledge_base", "answer")
     workflow.add_edge("database_lookup", "answer")
     workflow.add_edge("both_sources", "answer")
