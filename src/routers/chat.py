@@ -95,7 +95,8 @@ async def chat(
 
     context = AgentContext(
         admin_id=admin_id,
-        user_id=pk,
+        user_id=supabase_user_id,
+        customer_pk=pk,
         tenant_pk_column=pk_column,
         engine=engine,
     )

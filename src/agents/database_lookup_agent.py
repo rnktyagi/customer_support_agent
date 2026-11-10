@@ -61,6 +61,7 @@ MAX_ROWS = 50
 class AgentContext:
     admin_id: str
     user_id: str
+    customer_pk: str
     tenant_pk_column: str
     engine: Engine
 
@@ -466,7 +467,7 @@ def sql_execution_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> 
 
     try:
         with context.engine.connect() as conn:
-            result = conn.execute(text(sql), {"tenant_user_pk": context.user_id})
+            result = conn.execute(text(sql), {"tenant_user_pk": context.customer_pk})
             rows = result.mappings().fetchmany(MAX_ROWS)
 
         db_rows = [
