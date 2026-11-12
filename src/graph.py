@@ -1,98 +1,29 @@
-import os
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, START, END
-from typing import TypedDict, Annotated, List, Literal, Optional
+from typing import TypedDict, Annotated, List, Literal, Optional, Union
 from langgraph.graph.message import add_messages, RemoveMessage
 from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
 from langgraph.types import Command
 from typesafe_sdk import TypeSafeClient, Choice,Score
 import tiktoken
 
-from src.agents.knowledge_base_agent import build_agent as build_kb_agent, KBContext
+from src.agents.knowledge_base_agent import build_agent as build_kb_agent
 from src.agents.database_lookup_agent import build_agent as build_db_agent, AgentContext
 import json
 from langchain_core.messages import SystemMessage
 from langchain_core.runnables import RunnableConfig
-from langchain_openai import ChatOpenAI
 from langgraph.runtime import Runtime
-import asyncio
-from functools import lru_cache
 from pydantic import BaseModel, Field
-from supabase import create_client, Client
 
 load_dotenv()
 
 kb_subgraph = build_kb_agent()
 db_subgraph = build_db_agent()
 
-jev_client = TypeSafeClient(
-    api_key=os.environ["OPENROUTER_API_KEY"],
-    base_url="https://openrouter.ai/api",
-)
-
-answer_llm = ChatOpenAI(
-    model="openai/gpt-oss-120b",
-    openai_api_key=os.getenv("GROQ_API_KEY"),
-    openai_api_base="https://api.groq.com/openai/v1",
-    temperature=0,
-)
-
-# Summarizes conversation history when it grows past SUMMARY_TOKEN_LIMIT.
-# The conversation (not the chunk/table store) is the only unbounded context in
-# this system, so summarization lives here in the parent graph, once.
-summarizer_llm = ChatOpenAI(
-    model="llama-3.1-8b-instant",
-    openai_api_key=os.getenv("GROQ_API_KEY"),
-    openai_api_base="https://api.groq.com/openai/v1",
-    temperature=0,
-)
-
 SUMMARY_TOKEN_LIMIT = 4000
-# Messages kept verbatim (recent turns carry the most nuance).
 SUMMARY_KEEP_LAST = 2
 
-
-_encoder = tiktoken.get_encoding("o200k_base")
-
-
-def _message_tokens(messages) -> int:
-    """Token estimate for the conversation history."""
-    return sum(len(_encoder.encode(str(m.content))) for m in messages)
-
-
-def summarize_history_node(state: State) -> Command:
-    """Replace older turns with a compact summary, keeping the last turns raw.
-
-    Must return a Command with RemoveMessage entries: the messages reducer
-    appends on a plain dict return, so returning a new list would only add to
-    the history instead of replacing it.
-    """
-    messages = state.get("messages") or []
-    if len(messages) <= SUMMARY_KEEP_LAST:
-        return Command(update={"messages": []})
-
-    to_summarize, keep = messages[:-SUMMARY_KEEP_LAST], messages[-SUMMARY_KEEP_LAST:]
-
-    summary = summarizer_llm.invoke([
-        SystemMessage(content=(
-            "Summarize the conversation so far for a customer support agent. "
-            "Preserve the customer's issue, any account/order details, what was "
-            "decided, and any open questions. Be concise but complete."
-        )),
-        *to_summarize,
-    ]).content
-
-    return Command(update={
-        "messages": [RemoveMessage(id=m.id) for m in to_summarize]
-                     + [AIMessage(content=summary)],
-    })
-
-
-def route_before_router(state: State) -> str:
-    """Summarize only when the conversation actually exceeds the budget."""
-    if _message_tokens(state.get("messages") or []) > SUMMARY_TOKEN_LIMIT:
-        return "summarize"
-    return "router"
+encoder = tiktoken.get_encoding("o200k_base")
 
 class State(TypedDict) :
     messages : Annotated[List[AnyMessage], add_messages]
@@ -104,14 +35,40 @@ class State(TypedDict) :
     db_rows: List[dict]
     db_status: Optional[Literal["ok", "failed"]]
 
+def message_tokens(messages) -> int:
+    return sum(len(encoder.encode(str(m.content))) for m in messages)
 
-# A retrieval source is included when JEV assigns it at least this much probability.
-# Below the threshold the query is treated as single-source.
-ROUTE_PROB_THRESHOLD = 0.65
+def summarize_history_node(state: State, runtime: Runtime[AgentContext]) -> Command:
+    messages = state.get("messages") or []
+    if len(messages) <= SUMMARY_KEEP_LAST:
+        return Command(update={"messages": []})
 
+    to_summarize, keep = messages[:-SUMMARY_KEEP_LAST], messages[-SUMMARY_KEEP_LAST:]
+
+    summary = runtime.context.deps.summarizer_llm.invoke([
+        SystemMessage(content=(
+            "Summarize the conversation so far for a customer support agent. "
+            "Preserve the customer's issue, any account/order details, what was "
+            "decided, and any open questions. Be concise but complete."
+        )),
+        *to_summarize,
+    ]).content
+
+    return Command(update={
+        "messages": [RemoveMessage(id=m.id) for m in messages]
+                     + [AIMessage(content=f"Summary of the earlier conversation: {summary}")]
+                     + [type(m)(content=m.content) for m in keep],
+    })
+
+
+def route_before_router(state: State) -> str:
+    if message_tokens(state.get("messages") or []) > SUMMARY_TOKEN_LIMIT:
+        return "summarize"
+    return "router"
+
+ROUTE_PROB_THRESHOLD = 0.375
 
 def decide_sources(probs) -> List[str]:
-    """Return the set of retrieval sources JEV assigns meaningful probability to."""
     sources = []
     for label in ("knowledge_base", "database_lookup"):
         if (probs.get(label) or 0.0) >= ROUTE_PROB_THRESHOLD:
@@ -122,7 +79,7 @@ def decide_sources(probs) -> List[str]:
             sources = [winner]
     return sources
 
-def routing_decision_node(state : State) :
+def routing_decision_node(state : State, runtime: Runtime[AgentContext]) :
     messages = state.get("messages")
     current_query = messages[-1].content
     history = "\n".join(f"{m.type}: {m.content}"for m in messages[:-1])
@@ -138,7 +95,7 @@ According to the given user query, you have to decide between the given 4 differ
 4. Irrelvant : If the user query is completely irrelevant to your role kindly route it as irrelvant.
 """
     try :
-        response = jev_client.system_one(
+        response = runtime.context.deps.jev.system_one(
             model="jev-1.13",
             state=f"{PROMPT}\n\nConversation History:\n{history}\n\nCurrent Query:\n{current_query}",
             questions={
@@ -168,15 +125,15 @@ According to the given user query, you have to decide between the given 4 differ
         return {"route" : route , "urgency" : urgency, "urgency_score" : urgency_score, "sources" : sources}
     except Exception as e :
         print(f"{e}")
-        return {"route": None, "urgency": None}
+        return {"route": None, "urgency": None, "urgency_score": None, "sources": None}
 
 
-def route_after_router(state: State) -> Literal["knowledge_base", "database_lookup", "both_sources", "human_escalate", "irrelevant"]:
+def route_after_router(state: State) -> Union[str, List[str]]:
     if state.get("urgency") == "high":
         return "human_escalate"
     sources = state.get("sources") or []
     if len(sources) == 2:
-        return "both_sources"
+        return ["knowledge_base", "database_lookup"]
     if state.get("route") == "database_lookup":
         return "database_lookup"
     if state.get("route") == "human_escalate":
@@ -199,36 +156,12 @@ async def knowledge_base_node(state: State, runtime: Runtime[AgentContext], conf
     result = await kb_subgraph.ainvoke(
         {"messages": state["messages"]},
         config,
-        context=KBContext(admin_id=runtime.context.admin_id),
+        context=runtime.context,
     )
     return {"retrieved_context": result.get("retrieved_context")}
 
 
-async def both_sources_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
-    """Run the KB and DB subgraphs sequentially and merge their results.
-
-    Sequential (not parallel) on purpose: both subgraphs use per-thread
-    checkpointers, so invoking them concurrently under the same thread_id
-    would cause checkpoint namespace conflicts.
-    """
-    kb_result = await kb_subgraph.ainvoke(
-        {"messages": state["messages"]},
-        config,
-        context=KBContext(admin_id=runtime.context.admin_id),
-    )
-    db_result = await db_subgraph.ainvoke(
-        {"messages": state["messages"]},
-        config,
-        context=runtime.context,
-    )
-    return {
-        "retrieved_context": kb_result.get("retrieved_context"),
-        "db_rows": db_result.get("db_rows", []),
-        "db_status": db_result.get("db_status"),
-    }
-
-
-async def answer_node(state: State) -> dict:
+async def answer_node(state: State, runtime: Runtime[AgentContext]) -> dict:
     sources = state.get("sources") or []
     has_kb = "knowledge_base" in sources
     has_db = "database_lookup" in sources
@@ -237,29 +170,31 @@ async def answer_node(state: State) -> dict:
     db_ok = state.get("db_status") == "ok"
     context = (state.get("retrieved_context") or "").strip()
 
-    # Neither source produced anything usable.
-    if not has_kb and not has_db:
-        return {"messages": [AIMessage(content="I couldn't find any information to answer that. Please try rephrasing.")]}
-    if has_kb and not context:
-        return {"messages": [AIMessage(content="I couldn't find anything about that in the company's documents.")]}
-    if has_db and (not db_ok or not db_rows):
-        return {"messages": [AIMessage(content="I couldn't retrieve that information right now. Please try again or rephrase your request.")]}
-
     parts = []
-    if has_kb:
+    if has_kb and context:
         parts.append(f"<documents>{context}</documents>")
-    if has_db:
+    if has_db and db_ok and db_rows:
         parts.append(f"<database_rows>{json.dumps(db_rows)}</database_rows>")
+
+    if not parts:
+        if has_kb and not context:
+            return {"messages": [AIMessage(content="I couldn't find anything about that in the company's documents.")]}
+        if has_db and not db_ok:
+            return {"messages": [AIMessage(content="I couldn't retrieve that information right now. Please try again or rephrase your request.")]}
+        if has_db and not db_rows:
+            return {"messages": [AIMessage(content="I couldn't find any matching records for your account.")]}
+        return {"messages": [AIMessage(content="I couldn't find any information to answer that. Please try rephrasing.")]}
+
     source = "\n".join(parts)
 
     messages = state.get("messages")
-    response = await answer_llm.ainvoke([
+    response = await runtime.context.deps.llm.ainvoke([
         SystemMessage(content=(
             "You are a customer support assistant. Answer the user's latest question using only the "
             "information in the <context> block below. If it does not contain the answer, say you "
             "could not find it. Do not invent values. Mention the source and page when it helps."
         )),
-        
+
         HumanMessage(content=f"<context>\n{source}\n</context>"),
         *messages,
     ])
@@ -270,22 +205,16 @@ class TicketDraft(BaseModel):
     subject: str = Field(description="Short title of the issue, at most 120 characters")
     description: str = Field(description="Clear summary of the customer's issue and what they need, based on the conversation")
     category: Literal["billing", "technical", "account", "other"]
-    # Optional: priority is set by the router's urgency assessment, not the LLM.
     priority: Optional[Literal["low", "medium", "high"]] = None
 
 
-ticket_llm = answer_llm.with_structured_output(TicketDraft)
-
-
-@lru_cache(maxsize=1)
-def get_supabase() -> Client:
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
 
 async def human_escalate_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
     messages = state.get("messages")
     priority = state.get("urgency") or "medium"
 
+    ticket_llm = runtime.context.deps.llm.with_structured_output(TicketDraft)
     draft = await ticket_llm.ainvoke([
         SystemMessage(content=(
             "You create support tickets. From the conversation, write a short subject, a clear "
@@ -304,7 +233,7 @@ async def human_escalate_node(state: State, runtime: Runtime[AgentContext], conf
     }
 
     try:
-        result = await asyncio.to_thread(get_supabase().table("tickets").insert(ticket).execute)
+        result = await runtime.context.deps.supabase.table("tickets").insert(ticket).execute()
         ticket_id = result.data[0]["id"]
     except Exception as e:
         print(f"Ticket insert error: {e}")
@@ -327,7 +256,6 @@ def create_graph() -> StateGraph:
     workflow.add_node("knowledge_base", knowledge_base_node)
     workflow.add_node("answer", answer_node)
     workflow.add_node("database_lookup", database_lookup_node)
-    workflow.add_node("both_sources", both_sources_node)
     workflow.add_node("human_escalate", human_escalate_node)
     workflow.add_node("irrelevant", irrelevant_node)
     workflow.add_node("summarize", summarize_history_node)
@@ -347,7 +275,6 @@ def create_graph() -> StateGraph:
         {
             "knowledge_base": "knowledge_base",
             "database_lookup": "database_lookup",
-            "both_sources": "both_sources",
             "human_escalate": "human_escalate",
             "irrelevant": "irrelevant",
         }
@@ -356,7 +283,6 @@ def create_graph() -> StateGraph:
     workflow.add_edge("summarize", "router")
     workflow.add_edge("knowledge_base", "answer")
     workflow.add_edge("database_lookup", "answer")
-    workflow.add_edge("both_sources", "answer")
     workflow.add_edge("answer", END)
     workflow.add_edge("human_escalate", END)
     workflow.add_edge("irrelevant", END)

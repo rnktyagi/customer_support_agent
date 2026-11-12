@@ -1,14 +1,12 @@
 import os
 import re
 import asyncio
-from dataclasses import dataclass
 from datetime import date
 from typing import TypedDict, Optional, Literal, List
 from dotenv import load_dotenv
 
 import tiktoken
 
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.runtime import Runtime
@@ -18,52 +16,15 @@ from sqlalchemy.engine import Engine
 
 from typesafe_sdk import TypeSafeClient, Choice
 
+from src.agents.context import AgentContext
 from src.database_lookup.retrieval import SchemeRetriever
 
 load_dotenv()
-
-sql_llm = ChatOpenAI(
-    model="openai/gpt-oss-20b",
-    openai_api_key=os.getenv("GROQ_API_KEY"),
-    openai_api_base="https://api.groq.com/openai/v1",
-    temperature=0,
-)
-
-scheme_retriever: Optional[SchemeRetriever] = None
-
-
-def get_scheme_retriever() -> SchemeRetriever:
-    global scheme_retriever
-    if scheme_retriever is None:
-        scheme_retriever = SchemeRetriever()
-    return scheme_retriever
-
-
-jev_client: Optional[TypeSafeClient] = None
-
-
-def get_jev_client() -> TypeSafeClient:
-    global jev_client
-    if jev_client is None:
-        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("TYPESAFE_API_KEY", "")
-        base_url = os.getenv("TYPESAFE_BASE_URL", "https://openrouter.ai/api")
-        jev_client = TypeSafeClient(api_key=api_key, base_url=base_url)
-    return jev_client
-
 
 encoder = tiktoken.get_encoding("o200k_base")
 
 TABLE_TOKEN_LIMIT = 8000
 MAX_ROWS = 50
-
-
-@dataclass
-class AgentContext:
-    admin_id: str
-    user_id: str
-    customer_pk: str
-    tenant_pk_column: str
-    engine: Engine
 
 
 class DBLookupState(TypedDict):
@@ -106,7 +67,7 @@ def preprocess_node(state: DBLookupState) -> dict:
     }
 
 
-def context_sufficiency_gate_node(state: DBLookupState) -> dict:
+def context_sufficiency_gate_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     messages = state.get("messages", [])
     current_query = state.get("current_query", "").strip()
     store = state.get("table_store") or []
@@ -165,7 +126,7 @@ Turn 2: "Fetch me the top 5 products which are sold the most." -> related to pro
 </current_query>"""
 
     try:
-        client = get_jev_client()
+        client = runtime.context.deps.jev
         response = client.system_one(
             model="jev-1.13",
             state=prompt_state,
@@ -189,7 +150,7 @@ Turn 2: "Fetch me the top 5 products which are sold the most." -> related to pro
     return {"decision": decision}
 
 
-def query_rewriter_node(state: DBLookupState) -> dict:
+def query_rewriter_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     current_query = state.get("current_query", "")
     messages = state.get("messages", [])
 
@@ -205,7 +166,7 @@ Rules:
 4. Output ONLY the query with no explanation."""
 
     try:
-        response = sql_llm.invoke([
+        response = runtime.context.deps.sql_llm.invoke([
             SystemMessage(content=system_instruction),
             HumanMessage(content=(
                 f"Conversation so far:\n{history}\n\n"
@@ -228,7 +189,7 @@ async def retrieval_node(state: DBLookupState, runtime: Runtime[AgentContext]) -
     admin_id = runtime.context.admin_id
 
     try:
-        results = await asyncio.to_thread(get_scheme_retriever().retrieve, query, admin_id)
+        results = await asyncio.to_thread(runtime.context.deps.scheme_retriever.retrieve, query, admin_id)
     except Exception as e:
         print(f"Schema retrieval error: {e}")
         return {"new_tables": []}
@@ -255,7 +216,7 @@ async def retrieval_node(state: DBLookupState, runtime: Runtime[AgentContext]) -
     return {"new_tables": new_tables}
 
 
-def retrieval_evaluation_node(state: DBLookupState) -> dict:
+def retrieval_evaluation_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     new_tables = state.get("new_tables") or []
     current_query = state.get("current_query", "")
     rewritten_query = state.get("rewritten_query", current_query)
@@ -280,7 +241,7 @@ Retrieved Tables:
 {new_tables_text}"""
 
     try:
-        client = get_jev_client()
+        client = runtime.context.deps.jev
         response = client.system_one(
             model="jev-1.13",
             state=prompt_state,
@@ -303,7 +264,7 @@ Retrieved Tables:
     return {"retrieval_status": status}
 
 
-def broaden_query_node(state: DBLookupState) -> dict:
+def broaden_query_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     current_query = state.get("current_query", "")
     previous_query = state.get("rewritten_query", current_query)
     retry_count = state.get("retry_count", 0)
@@ -321,7 +282,7 @@ Previous Search: {previous_query}
     prompt += "\nProvide ONLY the reformulated search query:"
 
     try:
-        response = sql_llm.invoke(prompt)
+        response = runtime.context.deps.sql_llm.invoke(prompt)
         broader_query = response.content.strip().strip('"').strip("'")
         if not broader_query:
             broader_query = f"{current_query} details"
@@ -403,7 +364,7 @@ Rules:
         )
 
     try:
-        response = sql_llm.invoke([
+        response = runtime.context.deps.sql_llm.invoke([
             SystemMessage(content=system_instruction),
             HumanMessage(content=user_prompt),
         ])
@@ -420,7 +381,7 @@ Rules:
     }
 
 
-def sql_guard_node(state: DBLookupState) -> dict:
+def sql_guard_node(state: DBLookupState, runtime: Runtime[AgentContext]) -> dict:
     sql = (state.get("sql_query") or "").strip().rstrip(";").strip()
     lowered = sql.lower()
     question = state.get("current_query", "")
@@ -445,7 +406,7 @@ Generated SQL:
 {sql}"""
 
     try:
-        client = get_jev_client()
+        client = runtime.context.deps.jev
         response = client.system_one(
             model="jev-1.13",
             state=prompt_state,

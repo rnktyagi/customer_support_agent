@@ -5,58 +5,21 @@ from dotenv import load_dotenv
 
 import tiktoken
 
-from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AnyMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.runtime import Runtime
-from dataclasses import dataclass
 
 from typesafe_sdk import TypeSafeClient, Choice
 
+from src.agents.context import AgentContext
 from src.knowledge_base.retrieval import Retriever
 
 load_dotenv()
 
-llm = ChatOpenAI(
-    model="openai/gpt-oss-120b",
-    openai_api_key=os.getenv("GROQ_API_KEY"),
-    openai_api_base="https://api.groq.com/openai/v1",
-    temperature=0,
-)
-
-retriever: Optional[Retriever] = None
-
-
-def get_retriever() -> Retriever:
-    global retriever
-    if retriever is None:
-        retriever = Retriever()
-    return retriever
-
-
-jev_client: Optional[TypeSafeClient] = None
-
-
-def get_jev_client() -> TypeSafeClient:
-    global jev_client
-    if jev_client is None:
-        api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("TYPESAFE_API_KEY", "")
-        base_url = os.getenv("TYPESAFE_BASE_URL", "https://openrouter.ai/api")
-        jev_client = TypeSafeClient(
-            api_key=api_key,
-            base_url=base_url,
-        )
-    return jev_client
-
-
 FALLBACK_RESPONSE = "Your question is irrelevant to the given file."
 encoder = tiktoken.get_encoding("o200k_base")
 
-CHUNK_TOKEN_LIMIT = 15000 
-
-@dataclass
-class KBContext:
-    admin_id: str
+CHUNK_TOKEN_LIMIT = 15000
 
 
 class RAGWorkflowState(TypedDict):
@@ -88,7 +51,7 @@ def preprocess_node(state: RAGWorkflowState) -> dict:
     }
 
 
-def context_sufficiency_gate_node(state: RAGWorkflowState) -> dict:
+def context_sufficiency_gate_node(state: RAGWorkflowState, runtime: Runtime[AgentContext]) -> dict:
     messages = state.get("messages", [])
     current_query = state.get("current_query", "").strip()
     store = state.get("chunk_store") or []
@@ -134,7 +97,7 @@ If ANY of the four fails, or you are uncertain, you MUST RETRIEVE.
 </current_query>"""
 
     try:
-        client = get_jev_client()
+        client = runtime.context.deps.jev
         response = client.system_one(
             model="jev-1.13",
             state=prompt_state,
@@ -160,7 +123,7 @@ If ANY of the four fails, or you are uncertain, you MUST RETRIEVE.
     return {"decision": "retrieve"}
 
 
-def query_rewriter_node(state: RAGWorkflowState) -> dict:
+def query_rewriter_node(state: RAGWorkflowState, runtime: Runtime[AgentContext]) -> dict:
     current_query = state.get("current_query", "")
     messages = state.get("messages", [])
 
@@ -177,7 +140,7 @@ Rules:
 4. Output ONLY the standalone search query string with no explanation or punctuation prefix."""
 
     try:
-        response = llm.invoke([
+        response = runtime.context.deps.llm.invoke([
             SystemMessage(content=system_instruction),
             HumanMessage(content=(
                 f"Conversation so far:\n{history}\n\n"
@@ -195,7 +158,7 @@ Rules:
     return {"rewritten_query": rewritten}
 
 
-async def retrieval_node(state: RAGWorkflowState, runtime: Runtime[KBContext]) -> dict:
+async def retrieval_node(state: RAGWorkflowState, runtime: Runtime[AgentContext]) -> dict:
     query = state.get("rewritten_query") or state.get("current_query", "")
 
     admin_id = runtime.context.admin_id
@@ -203,7 +166,7 @@ async def retrieval_node(state: RAGWorkflowState, runtime: Runtime[KBContext]) -
         print("Retrieval error: admin_id missing in context")
         return {"new_chunks": []}
 
-    retriever_inst = get_retriever()
+    retriever_inst = runtime.context.deps.kb_retriever
     results = await asyncio.to_thread(retriever_inst.retrieve, query, admin_id)
 
     new_chunks = [
@@ -229,7 +192,7 @@ async def retrieval_node(state: RAGWorkflowState, runtime: Runtime[KBContext]) -
     return {"new_chunks": new_chunks}
 
 
-def retrieval_evaluation_node(state: RAGWorkflowState) -> dict:
+def retrieval_evaluation_node(state: RAGWorkflowState, runtime: Runtime[AgentContext]) -> dict:
     new_chunks = state.get("new_chunks") or []
     current_query = state.get("current_query", "")
     rewritten_query = state.get("rewritten_query", current_query)
@@ -256,7 +219,7 @@ Retrieved Document Chunks:
 {new_chunks_text}"""
 
     try:
-        client = get_jev_client()
+        client = runtime.context.deps.jev
         response = client.system_one(
             model="jev-1.13",
             state=prompt_state,
@@ -279,7 +242,7 @@ Retrieved Document Chunks:
     return {"retrieval_status": status}
 
 
-def broaden_query_node(state: RAGWorkflowState) -> dict:
+def broaden_query_node(state: RAGWorkflowState, runtime: Runtime[AgentContext]) -> dict:
     current_query = state.get("current_query", "")
     previous_query = state.get("rewritten_query", current_query)
     retry_count = state.get("retry_count", 0)
@@ -293,7 +256,7 @@ Previous Failed Search: {previous_query}
 Provide ONLY the reformulated broader search query:"""
 
     try:
-        response = llm.invoke(prompt)
+        response = runtime.context.deps.llm.invoke(prompt)
         broader_query = response.content.strip().strip('"').strip("'")
         if not broader_query:
             broader_query = f"{current_query} overview details"
@@ -368,7 +331,7 @@ def route_after_add(state: RAGWorkflowState) -> Literal["trim_oldest", "build_co
 
 
 def create_workflow_graph() -> StateGraph:
-    workflow = StateGraph(RAGWorkflowState, context_schema=KBContext)
+    workflow = StateGraph(RAGWorkflowState, context_schema=AgentContext)
 
     workflow.add_node("preprocess", preprocess_node)
     workflow.add_node("context_sufficiency_gate", context_sufficiency_gate_node)

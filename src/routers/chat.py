@@ -94,6 +94,7 @@ async def chat(
         raise HTTPException(status_code=404, detail="Customer email not found in admin's database.")
 
     context = AgentContext(
+        deps=request.app.state.deps,
         admin_id=admin_id,
         user_id=supabase_user_id,
         customer_pk=pk,
