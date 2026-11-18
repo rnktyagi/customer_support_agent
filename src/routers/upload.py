@@ -1,8 +1,10 @@
 import asyncio
 from typing import List
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from pydantic import BaseModel
+
+from src.dependencies import resolve_admin_context, get_scheme_embedding, get_kb_embedding
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
@@ -25,53 +27,33 @@ class UploadDBRequest(BaseModel):
 
 @router.post("/database", response_model=UploadDBResponse)
 async def upload_database(
-    request: Request,
     body: UploadDBRequest,
+    admin_id=Depends(lambda: Depends(lambda r: resolve_admin_context(r))),
+    scheme_embedding=Depends(lambda r: r.app.state.scheme_embedding),
 ):
+    if body.admin_id != admin_id:
+        raise HTTPException(403, "admin_id mismatch")
+
     supabase = request.app.state.supabase
-
-    admin = await supabase.table("admins").select("id").eq("id", body.admin_id).maybe_single().execute()
-    if admin is None or admin.data is None:
-        raise HTTPException(status_code=403, detail="Invalid admin_id.")
-
     await supabase.table("admins").update({
         "database_url": body.database_url,
         "identity_table": body.identity_table,
         "pk_column": body.pk_column,
         "email_column": body.email_column,
-    }).eq("id", body.admin_id).execute()
+    }).eq("id", admin_id).execute()
 
-    try:
-        ids = await asyncio.to_thread(
-            request.app.state.scheme_embedding.create_embeddings, body.database_url, body.admin_id
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    ids = await asyncio.to_thread(
+        scheme_embedding.create_embeddings, body.database_url, admin_id
+    )
     return UploadDBResponse(table_ids=ids)
 
 
 @router.post("/knowledge_base", response_model=UploadKBResponse)
 async def upload_knowledge_base(
-    request: Request,
-    admin_id: str = Form(...),
+    admin_id=Depends(lambda: Depends(lambda r: resolve_admin_context(r))),
     files: List[UploadFile] = File(...),
+    kb_embedding=Depends(lambda r: r.app.state.kb_embedding),
 ):
-    supabase = request.app.state.supabase
-
-    admin = await supabase.table("admins").select("id").eq("id", admin_id).maybe_single().execute()
-    if admin is None or admin.data is None:
-        raise HTTPException(status_code=403, detail="Invalid admin_id.")
-
-    # Streamlit sends raw bytes via multipart; FastAPI wraps them as UploadFile.
-    # We extract the bytes back for the ingestion layer.
-    file_bytes = [(f.file.read(), f.filename) for f in files]
-
-    try:
-        ids = await asyncio.to_thread(
-            request.app.state.kb_embedding.upload_files, file_bytes, admin_id
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
+    files = [(f.file, f.filename) for f in files]
+    ids = await asyncio.to_thread(kb_embedding.upload_files, files, admin_id)
     return UploadKBResponse(chunk_ids=ids)

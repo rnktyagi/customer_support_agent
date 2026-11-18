@@ -2,9 +2,9 @@ from docling.document_converter import DocumentConverter
 from docling.chunking import HybridChunker
 from transformers import AutoTokenizer
 from langchain_core.documents import Document
-from io import BytesIO
 import uuid
-from docling.datamodel.base_models import DocumentStream
+import tempfile
+import os
 
 class Ingestion:
     def __init__(self):
@@ -12,9 +12,23 @@ class Ingestion:
         self.tokenizer = AutoTokenizer.from_pretrained("BAAI/bge-base-en-v1.5")
         self.chunker = HybridChunker(tokenizer=self.tokenizer, max_tokens=600, merge_peers=True)
 
-    def ingestion_and_chunking(self, file_bytes: bytes, filename: str):
-        source = DocumentStream(name=filename, stream=BytesIO(file_bytes))
-        result = self.converter.convert(source)
+    def ingestion_and_chunking(self, stream, filename: str):
+        # stream can be any file-like object (SpooledTemporaryFile, BytesIO, etc.)
+        # Write to a temp file and pass the path to Docling's converter (which accepts Path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
+            # stream may be SpooledTemporaryFile, BytesIO, BufferedReader, etc.
+            while True:
+                chunk = stream.read(8192)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+            tmp_path = tmp.name
+
+        try:
+            result = self.converter.convert(tmp_path)
+        finally:
+            os.unlink(tmp_path)
+
         chunks = list(self.chunker.chunk(result.document))
 
         for chunk in chunks:
@@ -35,7 +49,7 @@ class Ingestion:
                 Document(
                     page_content=chunk.text,
                     metadata={
-                        "source": chunk.meta.origin.filename,
+                        "source": filename,
                         "pages": pages,
                         "section": chunk.meta.headings[0] if chunk.meta.headings else None,
                     }
@@ -44,12 +58,12 @@ class Ingestion:
 
         return docs
 
-    def upload_files(self, files: list[tuple[bytes, str]]):
+    def upload_files(self, files: list[tuple]):
         docs = []
 
-        for file_bytes, filename in files:
+        for stream, filename in files:
             try:
-                docs.extend(self.ingestion_and_chunking(file_bytes, filename))
+                docs.extend(self.ingestion_and_chunking(stream, filename))
             except Exception as e:
                 print(f"Failed to ingest {filename}: {e}")
 
