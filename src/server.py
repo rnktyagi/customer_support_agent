@@ -1,4 +1,5 @@
 import os
+import httpx
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -54,19 +55,27 @@ async def lifespan(app: FastAPI):
         openai_api_base="https://api.groq.com/openai/v1",
         temperature=0,
     )
+    http_client = httpx.AsyncClient(timeout=30.0)
+
     deps = Deps(
         kb_retriever=Retriever(),
         scheme_retriever=SchemeRetriever(),
-        jev=jev,
+        jev=TypeSafeClient(
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            base_url="https://openrouter.ai/api",
+        ),
         llm=llm,
         sql_llm=sql_llm,
         summarizer_llm=summarizer_llm,
         supabase=app.state.supabase,
+        http_client=http_client,
     )
     app.state.deps = deps
     app.state.agent = build_agent(MemorySaver())
 
     yield
+
+    await http_client.aclose()
 
 
 app = FastAPI(title="Support Agent", lifespan=lifespan)

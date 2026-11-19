@@ -23,6 +23,13 @@ class UploadDBRequest(BaseModel):
     identity_table: str
     pk_column: str
     email_column: str
+    jira_base_url: str = ""
+    jira_email: str = ""
+    jira_token: str = ""
+    jira_project_key: str = ""
+    jira_issue_type: str = "Task"
+    slack_bot_token: str = ""
+    slack_channel_id: str = ""
 
 
 @router.post("/database", response_model=UploadDBResponse)
@@ -40,6 +47,13 @@ async def upload_database(
         "identity_table": body.identity_table,
         "pk_column": body.pk_column,
         "email_column": body.email_column,
+        "jira_base_url": body.jira_base_url,
+        "jira_email": body.jira_email,
+        "jira_token": body.jira_token,
+        "jira_project_key": body.jira_project_key,
+        "jira_issue_type": body.jira_issue_type,
+        "slack_bot_token": body.slack_bot_token,
+        "slack_channel_id": body.slack_channel_id,
     }).eq("id", admin_id).execute()
 
     ids = await asyncio.to_thread(

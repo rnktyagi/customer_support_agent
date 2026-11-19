@@ -1,4 +1,3 @@
-# diagnostic test
 import requests
 import streamlit as st
 
@@ -55,8 +54,6 @@ def set_step(step):
     st.rerun()
 
 
-# ── Step 1: Choose role ─────────────────────────────────
-
 def choose_role():
     st.title("🤖 Support Agent")
     st.write("Are you an admin or a customer?")
@@ -75,8 +72,6 @@ def choose_role():
             st.session_state.role = "customer"
             set_step("choose_action")
 
-
-# ── Step 2: Choose action ────────────────────────────────
 
 def choose_action():
     role = st.session_state.role
@@ -98,8 +93,6 @@ def choose_action():
     if st.button("← Back"):
         set_step("choose_role")
 
-
-# ── Step 3: Forms ────────────────────────────────────────
 
 def signup_form():
     role = st.session_state.role
@@ -170,6 +163,13 @@ def signin_form():
                         st.session_state.identity_table = r.get("identity_table")
                         st.session_state.pk_column = r.get("pk_column")
                         st.session_state.email_column = r.get("email_column")
+                        st.session_state.jira_base_url = r.get("jira_base_url", "")
+                        st.session_state.jira_email = r.get("jira_email", "")
+                        st.session_state.jira_token = r.get("jira_token", "")
+                        st.session_state.jira_project_key = r.get("jira_project_key", "")
+                        st.session_state.jira_issue_type = r.get("jira_issue_type", "Task")
+                        st.session_state.slack_bot_token = r.get("slack_bot_token", "")
+                        st.session_state.slack_channel_id = r.get("slack_channel_id", "")
                         go("admin_dashboard")
                 else:
                     r = api_post("/auth/user/signin", {"email": email, "password": password})
@@ -185,12 +185,9 @@ def signin_form():
         set_step("choose_action")
 
 
-# ── Admin Dashboard ────────────────────────────────────────────────
-
 def admin_dashboard():
     st.title("👨‍💼 Admin Dashboard")
 
-    # Header with admin code display and logout
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
         st.markdown(f"**Admin Code:** `{st.session_state.admin_code}`")
@@ -206,7 +203,6 @@ def admin_dashboard():
 
     st.divider()
 
-    # Database upload
     st.subheader("📊 Database Connection")
     db_url = st.session_state.get("database_url")
     if db_url:
@@ -228,6 +224,36 @@ def admin_dashboard():
         email_column = st.text_input("Email Column",
                                      value=st.session_state.get("email_column", "email"),
                                      placeholder="email")
+
+        st.divider()
+        st.markdown("**Jira Integration (Optional)**")
+        jira_base_url = st.text_input("Jira Base URL",
+                                      value=st.session_state.get("jira_base_url", ""),
+                                      placeholder="https://company.atlassian.net")
+        jira_email = st.text_input("Jira Email",
+                                   value=st.session_state.get("jira_email", ""),
+                                   placeholder="jira@company.com")
+        jira_token = st.text_input("Jira API Token",
+                                   type="password",
+                                   value=st.session_state.get("jira_token", ""),
+                                   placeholder="API token")
+        jira_project_key = st.text_input("Jira Project Key",
+                                         value=st.session_state.get("jira_project_key", ""),
+                                         placeholder="SUPP")
+        jira_issue_type = st.text_input("Jira Issue Type",
+                                        value=st.session_state.get("jira_issue_type", "Task"),
+                                        placeholder="Task")
+
+        st.divider()
+        st.markdown("**Slack Integration (Optional)**")
+        slack_bot_token = st.text_input("Slack Bot Token",
+                                        type="password",
+                                        value=st.session_state.get("slack_bot_token", ""),
+                                        placeholder="xoxb-...")
+        slack_channel_id = st.text_input("Slack Channel ID",
+                                         value=st.session_state.get("slack_channel_id", ""),
+                                         placeholder="C01234567")
+
         if st.form_submit_button("Save & Index Schema", use_container_width=True):
             if not url:
                 st.error("Please enter a database URL")
@@ -239,6 +265,13 @@ def admin_dashboard():
                         "identity_table": identity_table,
                         "pk_column": pk_column,
                         "email_column": email_column,
+                        "jira_base_url": jira_base_url,
+                        "jira_email": jira_email,
+                        "jira_token": jira_token,
+                        "jira_project_key": jira_project_key,
+                        "jira_issue_type": jira_issue_type,
+                        "slack_bot_token": slack_bot_token,
+                        "slack_channel_id": slack_channel_id,
                     })
                     if "error" in r:
                         st.error(r["error"])
@@ -247,9 +280,15 @@ def admin_dashboard():
                         st.session_state.identity_table = identity_table
                         st.session_state.pk_column = pk_column
                         st.session_state.email_column = email_column
+                        st.session_state.jira_base_url = jira_base_url
+                        st.session_state.jira_email = jira_email
+                        st.session_state.jira_token = jira_token
+                        st.session_state.jira_project_key = jira_project_key
+                        st.session_state.jira_issue_type = jira_issue_type
+                        st.session_state.slack_bot_token = slack_bot_token
+                        st.session_state.slack_channel_id = slack_channel_id
                         st.success(f"Indexed {len(r['table_ids'])} tables")
 
-    # Knowledge base upload
     st.subheader("📚 Knowledge Base")
     if st.session_state.get("kb_uploaded"):
         st.success("✅ Knowledge base documents already uploaded.")
@@ -271,12 +310,9 @@ def admin_dashboard():
                 st.success(f"Created {len(r['chunk_ids'])} chunks")
 
 
-# ── Customer Chat ───────────────────────────────────────────────
-
 def customer_chat():
     st.title("💬 Support Chat")
 
-    # Header
     col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         st.markdown("Ask me anything about your account, orders, or company policies.")
@@ -294,12 +330,10 @@ def customer_chat():
 
     st.divider()
 
-    # Chat messages
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.write(msg["content"])
 
-    # Chat input
     if prompt := st.chat_input("Type your message..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.spinner("Thinking..."):
@@ -312,8 +346,6 @@ def customer_chat():
             st.session_state.messages.append({"role": "assistant", "content": r["reply"]})
             st.rerun()
 
-
-# ── Router ───────────────────────────────────────────────
 
 if st.session_state.page == "landing":
     step = st.session_state.get("step", "choose_role")

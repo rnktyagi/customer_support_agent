@@ -27,7 +27,7 @@ encoder = tiktoken.get_encoding("o200k_base")
 
 class State(TypedDict) :
     messages : Annotated[List[AnyMessage], add_messages]
-    route: Optional[Literal["knowledge_base", "database_lookup", "human_escalate", "Irrelevant"]]
+    route: Optional[Literal["knowledge_base", "database_lookup", "escalate", "Irrelevant"]]
     urgency: Optional[Literal["low", "medium", "high"]]
     urgency_score: Optional[int]
     sources: Optional[List[Literal["knowledge_base", "database_lookup"]]]
@@ -104,7 +104,7 @@ According to the given user query, you have to decide between the given 4 differ
                     criteria={
                         "knowledge_base": "Answerable from company policies, terms, or general info.",
                         "database_lookup": "Needs the user's own account/order data.",
-                        "human_escalate": "Frustration, dissatisfaction, or needs urgent human resolution.",
+                        "escalate": "Frustration, dissatisfaction, or needs urgent human resolution.",
                         "Irrelevant": "Unrelated to customer support at all.",
                         },
                     ),
@@ -129,17 +129,16 @@ According to the given user query, you have to decide between the given 4 differ
 
 
 def route_after_router(state: State) -> Union[str, List[str]]:
-    if state.get("urgency") == "high":
-        return "human_escalate"
+    route = state.get("route")
+
+    if route == "Irrelevant":
+        return "irrelevant"
+
     sources = state.get("sources") or []
     if len(sources) == 2:
         return ["knowledge_base", "database_lookup"]
     if state.get("route") == "database_lookup":
         return "database_lookup"
-    if state.get("route") == "human_escalate":
-        return "human_escalate"
-    if state.get("route") == "Irrelevant":
-        return "irrelevant"
     return "knowledge_base"
 
 
@@ -236,7 +235,10 @@ class TicketDraft(BaseModel):
 
 
 
-async def human_escalate_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
+from src.dependencies import create_jira_ticket, send_slack_message
+
+
+async def escalate_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
     messages = state.get("messages")
     priority = state.get("urgency") or "medium"
 
@@ -250,24 +252,58 @@ async def human_escalate_node(state: State, runtime: Runtime[AgentContext], conf
         *messages,
     ])
 
-    ticket = {
+    priority = state.get("urgency") or "medium"
+
+    ticket_data = {
         "user_id": runtime.context.user_id,
         "admin_id": runtime.context.admin_id,
         "thread_id": config["configurable"]["thread_id"],
         **draft.model_dump(),
-        "priority": priority,  
+        "priority": priority,
     }
 
+    supabase_ticket_id = None
     try:
-        result = await runtime.context.deps.supabase.table("tickets").insert(ticket).execute()
-        ticket_id = result.data[0]["id"]
+        result = await runtime.context.deps.supabase.table("tickets").insert(ticket_data).execute()
+        supabase_ticket_id = result.data[0]["id"]
     except Exception as e:
-        print(f"Ticket insert error: {e}")
+        print(f"Supabase ticket insert error: {e}")
         return {"messages": [AIMessage(content="I'm sorry, I wasn't able to log your request just now. Please try again in a moment, or contact our support team directly.")]}
 
+    jira_key = None
+    jira_config = runtime.context.deps.jira_config
+    if jira_config:
+        config_dict = jira_config.__dict__
+        if all(config_dict.get(k) for k in ("jira_base_url", "jira_email", "jira_token", "jira_project_key")):
+            try:
+                summary = draft.subject
+                description = f"{draft.description}\n\nCategory: {draft.category}\nPriority: {priority}"
+                jira_key = await create_jira_ticket(
+                    admin_config=jira_config.__dict__,
+                    http_client=runtime.context.deps.http_client,
+                    summary=summary,
+                    description=description,
+                    issue_type=jira_config.issue_type or "Task",
+                )
+            except Exception as e:
+                print(f"Jira ticket creation error: {e}")
+
+    slack_config = runtime.context.deps.slack_config
+    if slack_config and slack_config.bot_token and slack_config.channel_id:
+        try:
+            priority_display = priority.upper()
+            await send_slack_message(
+                admin_config=slack_config.__dict__,
+                http_client=runtime.context.deps.http_client,
+                text=f"🚨 *Escalation Alert* (Priority: {priority_display})\nJira: {jira_key or 'N/A'}\nSupabase: #{supabase_ticket_id}\nThread: {config['configurable']['thread_id']}",
+            )
+        except Exception as e:
+            print(f"Slack notification error: {e}")
+
+    ticket_display = jira_key or f"Supabase #{supabase_ticket_id}"
     return {"messages": [AIMessage(content=(
         "Thank you for reaching out, and I'm sorry for the trouble. I've escalated your request to our "
-        f"support team under ticket #{ticket_id}. A member of our team will contact you as soon as possible."
+        f"support team under ticket **{ticket_display}**. A member of our team will contact you as soon as possible."
     ))]}
 
 
@@ -282,7 +318,7 @@ def create_graph() -> StateGraph:
     workflow.add_node("knowledge_base", knowledge_base_node)
     workflow.add_node("answer", answer_node)
     workflow.add_node("database_lookup", database_lookup_node)
-    workflow.add_node("human_escalate", human_escalate_node)
+    workflow.add_node("escalate", escalate_node)
     workflow.add_node("irrelevant", irrelevant_node)
     workflow.add_node("summarize", summarize_history_node)
 
@@ -301,7 +337,7 @@ def create_graph() -> StateGraph:
         {
             "knowledge_base": "knowledge_base",
             "database_lookup": "database_lookup",
-            "human_escalate": "human_escalate",
+            "escalate": "escalate",
             "irrelevant": "irrelevant",
         }
     )
@@ -309,8 +345,16 @@ def create_graph() -> StateGraph:
     workflow.add_edge("summarize", "router")
     workflow.add_edge("knowledge_base", "answer")
     workflow.add_edge("database_lookup", "answer")
-    workflow.add_edge("answer", END)
-    workflow.add_edge("human_escalate", END)
+
+    workflow.add_conditional_edges(
+        "answer",
+        lambda state: "escalate" if state.get("urgency") == "high" else "end",
+        {
+            "escalate": "escalate",
+            "end": END,
+        }
+    )
+    workflow.add_edge("escalate", END)
     workflow.add_edge("irrelevant", END)
 
     return workflow

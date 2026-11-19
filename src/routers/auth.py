@@ -43,7 +43,7 @@ async def admin_signin(body: Credentials, request: Request):
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
-    admin = await request.app.state.supabase.table("admins").select("id, code, database_url, identity_table, pk_column, email_column").eq(
+    admin = await request.app.state.supabase.table("admins").select("id, code, database_url, identity_table, pk_column, email_column, jira_base_url, jira_email, jira_token, jira_project_key, jira_issue_type, slack_bot_token, slack_channel_id").eq(
         "user_id", result.user.id
     ).maybe_single().execute()
     if admin is None or admin.data is None:
@@ -56,6 +56,13 @@ async def admin_signin(body: Credentials, request: Request):
         "identity_table": admin.data.get("identity_table"),
         "pk_column": admin.data.get("pk_column"),
         "email_column": admin.data.get("email_column"),
+        "jira_base_url": admin.data.get("jira_base_url"),
+        "jira_email": admin.data.get("jira_email"),
+        "jira_token": admin.data.get("jira_token"),
+        "jira_project_key": admin.data.get("jira_project_key"),
+        "jira_issue_type": admin.data.get("jira_issue_type"),
+        "slack_bot_token": admin.data.get("slack_bot_token"),
+        "slack_channel_id": admin.data.get("slack_channel_id"),
     }
 
 

@@ -1,6 +1,10 @@
-from typing import Tuple
+from typing import Tuple, Optional
 from fastapi import Depends, Header, HTTPException
 from sqlalchemy import create_engine, text
+
+import os
+import httpx
+import json
 
 
 async def get_current_user(
@@ -115,3 +119,82 @@ async def get_chat_context(
         tenant_pk_column=admin_config["pk_column"],
         engine=engine,
     )
+
+
+async def create_jira_ticket(
+    admin_config: dict,
+    http_client: httpx.AsyncClient,
+    summary: str,
+    description: str,
+    issue_type: str = "Task",
+) -> Optional[str]:
+    base_url = admin_config.get("jira_base_url", "").rstrip("/")
+    email = admin_config.get("jira_email", "")
+    api_token = admin_config.get("jira_token", "")
+    project_key = admin_config.get("jira_project_key", "")
+    issue_type = issue_type or admin_config.get("jira_issue_type", "Task")
+
+    if not all([base_url, email, api_token, project_key]):
+        raise HTTPException(400, "Jira configuration incomplete for this admin.")
+
+    url = f"{base_url}/rest/api/3/issue"
+    auth = (email, api_token)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "fields": {
+            "project": {"key": project_key},
+            "summary": summary,
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": description}]
+                    }
+                ]
+            },
+            "issuetype": {"name": issue_type},
+        }
+    }
+
+    resp = await http_client.post(url, json=payload, headers=headers, auth=auth)
+    if resp.status_code not in (200, 201):
+        raise HTTPException(500, f"Jira API error: {resp.status_code} - {resp.text}")
+    return resp.json().get("key")
+
+
+async def send_slack_message(
+    admin_config: dict,
+    http_client: httpx.AsyncClient,
+    text: str,
+    blocks: Optional[list] = None,
+) -> bool:
+    bot_token = admin_config.get("slack_bot_token", "")
+    channel_id = admin_config.get("slack_channel_id", "")
+
+    if not bot_token or not channel_id:
+        raise HTTPException(400, "Slack configuration incomplete for this admin.")
+
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {bot_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "channel": channel_id,
+        "text": text,
+    }
+    if blocks:
+        payload["blocks"] = blocks
+
+    resp = await http_client.post(url, json=payload, headers=headers)
+    if resp.status_code != 200:
+        raise HTTPException(500, f"Slack API error: {resp.status_code} - {resp.text}")
+    data = resp.json()
+    if not data.get("ok"):
+        raise HTTPException(500, f"Slack API error: {data.get('error')}")
+    return True

@@ -13,10 +13,7 @@ class Ingestion:
         self.chunker = HybridChunker(tokenizer=self.tokenizer, max_tokens=600, merge_peers=True)
 
     def ingestion_and_chunking(self, stream, filename: str):
-        # stream can be any file-like object (SpooledTemporaryFile, BytesIO, etc.)
-        # Write to a temp file and pass the path to Docling's converter (which accepts Path)
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(filename)[1]) as tmp:
-            # stream may be SpooledTemporaryFile, BytesIO, BufferedReader, etc.
             while True:
                 chunk = stream.read(8192)
                 if not chunk:

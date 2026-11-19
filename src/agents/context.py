@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 from langchain_openai import ChatOpenAI
 from supabase import Client
@@ -10,6 +11,21 @@ from src.knowledge_base.retrieval import Retriever
 
 
 @dataclass
+class JiraConfig:
+    base_url: str = ""
+    email: str = ""
+    api_token: str = ""
+    project_key: str = ""
+    issue_type: str = "Task"
+
+
+@dataclass
+class SlackConfig:
+    bot_token: str = ""
+    channel_id: str = ""
+
+
+@dataclass
 class Deps:
     kb_retriever: Retriever
     scheme_retriever: SchemeRetriever
@@ -18,6 +34,8 @@ class Deps:
     sql_llm: ChatOpenAI
     summarizer_llm: ChatOpenAI
     supabase: Client
+    jira_config: Optional[JiraConfig] = None
+    slack_config: Optional[SlackConfig] = None
 
 
 @dataclass
