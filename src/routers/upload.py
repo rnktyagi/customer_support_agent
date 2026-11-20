@@ -34,6 +34,7 @@ class UploadDBRequest(BaseModel):
 
 @router.post("/database", response_model=UploadDBResponse)
 async def upload_database(
+    request: Request,
     body: UploadDBRequest,
     admin_id=Depends(lambda: Depends(lambda r: resolve_admin_context(r))),
     scheme_embedding=Depends(lambda r: r.app.state.scheme_embedding),
