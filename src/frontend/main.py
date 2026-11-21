@@ -7,6 +7,8 @@ BACKEND = "http://localhost:8000"
 
 
 def api_post(endpoint, data=None, files=None, token=None):
+    if token is None and "access_token" in st.session_state and st.session_state.access_token:
+        token = st.session_state.access_token
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -159,6 +161,7 @@ def signin_form():
                     else:
                         st.session_state.admin_id = r["admin_id"]
                         st.session_state.admin_code = r["admin_code"]
+                        st.session_state.access_token = r.get("access_token")
                         st.session_state.database_url = r.get("database_url")
                         st.session_state.identity_table = r.get("identity_table")
                         st.session_state.pk_column = r.get("pk_column")
@@ -185,6 +188,13 @@ def signin_form():
         set_step("choose_action")
 
 
+def logout():
+    for k in ["admin_id", "user_id", "admin_code", "identity_table", "pk_column", "email_column", "thread_id", "messages", "role", "database_url", "jira_base_url", "jira_email", "jira_token", "jira_project_key", "jira_issue_type", "slack_bot_token", "slack_channel_id", "kb_uploaded", "access_token"]:
+        st.session_state[k] = None if k != "messages" else []
+    st.session_state.page = "landing"
+    st.rerun()
+
+
 def admin_dashboard():
     st.title("👨‍💼 Admin Dashboard")
 
@@ -196,10 +206,7 @@ def admin_dashboard():
         st.write(f"Admin ID: `{st.session_state.admin_id}`")
     with col3:
         if st.button("Logout", use_container_width=True):
-            for k in ["admin_id", "user_id", "admin_code", "identity_table", "pk_column", "email_column", "thread_id", "messages", "role"]:
-                st.session_state[k] = None if k != "messages" else []
-            st.session_state.page = "landing"
-            st.rerun()
+            logout()
 
     st.divider()
 
@@ -225,8 +232,35 @@ def admin_dashboard():
                                      value=st.session_state.get("email_column", "email"),
                                      placeholder="email")
 
-        st.divider()
-        st.markdown("**Jira Integration (Optional)**")
+        if st.form_submit_button("Save & Index Schema", use_container_width=True):
+            if not url:
+                st.error("Please enter a database URL")
+            else:
+                with st.spinner("Saving and indexing..."):
+                    r = api_post("/upload/database", {
+                        "admin_id": st.session_state.admin_id,
+                        "database_url": url,
+                        "identity_table": identity_table,
+                        "pk_column": pk_column,
+                        "email_column": email_column,
+                    })
+                    if "error" in r:
+                        st.error(r["error"])
+                    else:
+                        st.session_state.database_url = url
+                        st.session_state.identity_table = identity_table
+                        st.session_state.pk_column = pk_column
+                        st.session_state.email_column = email_column
+                        st.success(f"Indexed {len(r['table_ids'])} tables")
+
+    st.divider()
+
+        st.subheader("🔗 Integrations")
+
+    col1, col2 = st.columns(2)
+
+    with st.form("jira_config"):
+        st.markdown("**Jira Integration**")
         jira_base_url = st.text_input("Jira Base URL",
                                       value=st.session_state.get("jira_base_url", ""),
                                       placeholder="https://company.atlassian.net")
@@ -244,8 +278,28 @@ def admin_dashboard():
                                         value=st.session_state.get("jira_issue_type", "Task"),
                                         placeholder="Task")
 
-        st.divider()
-        st.markdown("**Slack Integration (Optional)**")
+        if st.form_submit_button("Save Jira Config", use_container_width=True):
+            with st.spinner("Saving Jira config..."):
+                r = api_post("/upload/integrations", {
+                    "admin_id": st.session_state.admin_id,
+                    "jira_base_url": jira_base_url,
+                    "jira_email": jira_email,
+                    "jira_token": jira_token,
+                    "jira_project_key": jira_project_key,
+                    "jira_issue_type": jira_issue_type,
+                })
+                if "error" in r:
+                    st.error(r["error"])
+                else:
+                    st.session_state.jira_base_url = jira_base_url
+                    st.session_state.jira_email = jira_email
+                    st.session_state.jira_token = jira_token
+                    st.session_state.jira_project_key = jira_project_key
+                    st.session_state.jira_issue_type = jira_issue_type
+                    st.success("Jira configuration saved!")
+
+    with st.form("slack_config"):
+        st.markdown("**Slack Integration**")
         slack_bot_token = st.text_input("Slack Bot Token",
                                         type="password",
                                         value=st.session_state.get("slack_bot_token", ""),
@@ -254,42 +308,23 @@ def admin_dashboard():
                                          value=st.session_state.get("slack_channel_id", ""),
                                          placeholder="C01234567")
 
-        if st.form_submit_button("Save & Index Schema", use_container_width=True):
-            if not url:
-                st.error("Please enter a database URL")
-            else:
-                with st.spinner("Saving and indexing..."):
-                    r = api_post("/upload/database", {
-                        "admin_id": st.session_state.admin_id,
-                        "database_url": url,
-                        "identity_table": identity_table,
-                        "pk_column": pk_column,
-                        "email_column": email_column,
-                        "jira_base_url": jira_base_url,
-                        "jira_email": jira_email,
-                        "jira_token": jira_token,
-                        "jira_project_key": jira_project_key,
-                        "jira_issue_type": jira_issue_type,
-                        "slack_bot_token": slack_bot_token,
-                        "slack_channel_id": slack_channel_id,
-                    })
-                    if "error" in r:
-                        st.error(r["error"])
-                    else:
-                        st.session_state.database_url = url
-                        st.session_state.identity_table = identity_table
-                        st.session_state.pk_column = pk_column
-                        st.session_state.email_column = email_column
-                        st.session_state.jira_base_url = jira_base_url
-                        st.session_state.jira_email = jira_email
-                        st.session_state.jira_token = jira_token
-                        st.session_state.jira_project_key = jira_project_key
-                        st.session_state.jira_issue_type = jira_issue_type
-                        st.session_state.slack_bot_token = slack_bot_token
-                        st.session_state.slack_channel_id = slack_channel_id
-                        st.success(f"Indexed {len(r['table_ids'])} tables")
+        if st.form_submit_button("Save Slack Config", use_container_width=True):
+            with st.spinner("Saving Slack config..."):
+                r = api_post("/upload/integrations", {
+                    "admin_id": st.session_state.admin_id,
+                    "slack_bot_token": slack_bot_token,
+                    "slack_channel_id": slack_channel_id,
+                })
+                if "error" in r:
+                    st.error(r["error"])
+                else:
+                    st.session_state.slack_bot_token = slack_bot_token
+                    st.session_state.slack_channel_id = slack_channel_id
+                    st.success("Slack configuration saved!")
 
-    st.subheader("📚 Knowledge Base")
+    st.divider()
+
+        st.subheader("📚 Knowledge Base")
     if st.session_state.get("kb_uploaded"):
         st.success("✅ Knowledge base documents already uploaded.")
         st.write("Upload more to add to it:")
@@ -323,10 +358,7 @@ def customer_chat():
             st.rerun()
     with col3:
         if st.button("Logout", use_container_width=True):
-            for k in ["admin_id", "user_id", "admin_code", "identity_table", "pk_column", "email_column", "thread_id", "messages", "role"]:
-                st.session_state[k] = None if k != "messages" else []
-            st.session_state.page = "landing"
-            st.rerun()
+            logout()
 
     st.divider()
 

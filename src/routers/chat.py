@@ -6,12 +6,10 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel, Field
 
 from src.dependencies import (
-    get_current_user,
     resolve_customer_context,
     get_chat_context,
     get_agent,
 )
-from src.graph import AgentContext
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 

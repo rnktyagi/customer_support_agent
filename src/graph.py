@@ -4,9 +4,9 @@ from typing import TypedDict, Annotated, List, Literal, Optional, Union
 from langgraph.graph.message import add_messages, RemoveMessage
 from langchain_core.messages import AnyMessage, AIMessage, HumanMessage
 from langgraph.types import Command
-from typesafe_sdk import TypeSafeClient, Choice,Score
+from typesafe_sdk import Choice, Score
 import tiktoken
-
+import httpx
 from src.agents.knowledge_base_agent import build_agent as build_kb_agent
 from src.agents.database_lookup_agent import build_agent as build_db_agent, AgentContext
 import json
@@ -25,15 +25,94 @@ SUMMARY_KEEP_LAST = 2
 
 encoder = tiktoken.get_encoding("o200k_base")
 
+
+async def create_jira_ticket(
+    admin_config: dict,
+    http_client: httpx.AsyncClient,
+    summary: str,
+    description: str,
+    issue_type: str = "Task",
+) -> Optional[str]:
+    base_url = admin_config.get("jira_base_url", "").rstrip("/")
+    email = admin_config.get("jira_email", "")
+    api_token = admin_config.get("jira_token", "")
+    project_key = admin_config.get("jira_project_key", "")
+    issue_type = issue_type or admin_config.get("jira_issue_type", "Task")
+
+    if not all([base_url, email, api_token, project_key]):
+        return None
+
+    url = f"{base_url}/rest/api/3/issue"
+    auth = (email, api_token)
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "fields": {
+            "project": {"key": project_key},
+            "summary": summary,
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [{"type": "text", "text": description}]
+                    }
+                ]
+            },
+            "issuetype": {"name": issue_type},
+        }
+    }
+
+    resp = await http_client.post(url, json=payload, headers=headers, auth=auth)
+    if resp.status_code not in (200, 201):
+        return None
+    return resp.json().get("key")
+
+
+async def send_slack_message(
+    admin_config: dict,
+    http_client: httpx.AsyncClient,
+    text: str,
+) -> bool:
+    bot_token = admin_config.get("slack_bot_token", "")
+    channel_id = admin_config.get("slack_channel_id", "")
+
+    if not bot_token or not channel_id:
+        return False
+
+    url = "https://slack.com/api/chat.postMessage"
+    headers = {
+        "Authorization": f"Bearer {bot_token}",
+        "Content-Type": "application/json",
+    }
+    payload = {"channel": channel_id, "text": text}
+
+    resp = await http_client.post(url, json=payload, headers=headers)
+    if resp.status_code != 200:
+        return False
+    data = resp.json()
+    return data.get("ok", False)
+
 class State(TypedDict) :
     messages : Annotated[List[AnyMessage], add_messages]
     route: Optional[Literal["knowledge_base", "database_lookup", "escalate", "Irrelevant"]]
     urgency: Optional[Literal["low", "medium", "high"]]
-    urgency_score: Optional[int]
+    urgency_score: Optional[float]
     sources: Optional[List[Literal["knowledge_base", "database_lookup"]]]
     retrieved_context: Optional[str]
     db_rows: List[dict]
     db_status: Optional[Literal["ok", "failed"]]
+    answer_text: Annotated[Optional[str], lambda x, y: x or y]
+    ticket_display: Annotated[Optional[str], lambda x, y: x or y]
+    ticket_draft_subject: Optional[str]
+    ticket_draft_description: Optional[str]
+    ticket_draft_category: Optional[str]
+    supabase_ticket_id: Annotated[Optional[str], lambda x, y: x or y]
+    jira_key: Annotated[Optional[str], lambda x, y: x or y]
+    slack_ok: Annotated[Optional[bool], lambda x, y: x or y]
 
 def message_tokens(messages) -> int:
     return sum(len(encoder.encode(str(m.content))) for m in messages)
@@ -118,14 +197,28 @@ According to the given user query, you have to decide between the given 4 differ
                 )
             }
         )
-        route=response.answers['route'].choice
-        urgency_score=response.answers['urgency'].score
-        urgency = {0: "low", 1: "medium", 2: "high"}.get(urgency_score)
+        route = response.answers['route'].choice
+        urgency_score = response.answers['urgency'].score
+        if urgency_score is not None:
+            urgency = {0: "low", 1: "medium", 2: "high"}.get(int(round(urgency_score)), "medium")
+        else:
+            urgency = None
         sources = decide_sources(response.answers['route'].probabilities)
-        return {"route" : route , "urgency" : urgency, "urgency_score" : urgency_score, "sources" : sources}
+        return {"route": route, "urgency": urgency, "urgency_score": urgency_score, "sources": sources}
     except Exception as e :
         print(f"{e}")
         return {"route": None, "urgency": None, "urgency_score": None, "sources": None}
+
+
+def should_escalate(state: State) -> bool:
+    if state.get("route") == "escalate":
+        return True
+    if state.get("urgency") in ("medium", "high"):
+        return True
+    score = state.get("urgency_score")
+    if score is not None and score >= 1.0:
+        return True
+    return False
 
 
 def route_after_router(state: State) -> Union[str, List[str]]:
@@ -140,6 +233,16 @@ def route_after_router(state: State) -> Union[str, List[str]]:
     if state.get("route") == "database_lookup":
         return "database_lookup"
     return "knowledge_base"
+
+
+def retrieval_join_node(state: State) -> dict:
+    return {}
+
+
+def route_after_retrieval(state: State) -> List[str]:
+    if should_escalate(state):
+        return ["answer", "escalate"]
+    return ["answer"]
 
 
 async def database_lookup_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
@@ -177,12 +280,12 @@ async def answer_node(state: State, runtime: Runtime[AgentContext]) -> dict:
 
     if not parts:
         if has_kb and not context:
-            return {"messages": [AIMessage(content="I couldn't find anything about that in the company's documents.")]}
+            return {"answer_text": "I couldn't find anything about that in the company's documents."}
         if has_db and not db_ok:
-            return {"messages": [AIMessage(content="I couldn't retrieve that information right now. Please try again or rephrase your request.")]}
+            return {"answer_text": "I couldn't retrieve that information right now. Please try again or rephrase your request."}
         if has_db and not db_rows:
-            return {"messages": [AIMessage(content="I couldn't find any matching records for your account.")]}
-        return {"messages": [AIMessage(content="I couldn't find any information to answer that. Please try rephrasing.")]}
+            return {"answer_text": "I couldn't find any matching records for your account."}
+        return {"answer_text": "I couldn't find any information to answer that. Please try rephrasing."}
 
     source = "\n".join(parts)
 
@@ -223,7 +326,7 @@ Use the earlier conversation only to understand what the customer is asking. Nev
         HumanMessage(content=f"<context>\n{source}\n</context>"),
         *messages,
     ])
-    return {"messages": [AIMessage(content=response.content)]}
+    return {"answer_text": response.content}
 
 
 class TicketDraft(BaseModel):
@@ -232,17 +335,17 @@ class TicketDraft(BaseModel):
     category: Literal["billing", "technical", "account", "other"]
     priority: Optional[Literal["low", "medium", "high"]] = None
 
-
-
-
-from src.dependencies import create_jira_ticket, send_slack_message
-
-
 async def escalate_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
+    """
+    Step 1 of escalation pipeline.
+    Drafts a ticket via LLM and inserts it into Supabase.
+    Stores the draft fields and supabase_ticket_id into state for the downstream jira/slack nodes.
+    """
     messages = state.get("messages")
     priority = state.get("urgency") or "medium"
 
     ticket_llm = runtime.context.deps.llm.with_structured_output(TicketDraft)
+    print(f"[ticket_node] Drafting ticket for urgency={priority!r}...")
     draft = await ticket_llm.ainvoke([
         SystemMessage(content=(
             "You create support tickets. From the conversation, write a short subject, a clear "
@@ -251,8 +354,7 @@ async def escalate_node(state: State, runtime: Runtime[AgentContext], config: Ru
         )),
         *messages,
     ])
-
-    priority = state.get("urgency") or "medium"
+    print(f"[ticket_node] Draft => subject={draft.subject!r}, category={draft.category!r}")
 
     ticket_data = {
         "user_id": runtime.context.user_id,
@@ -266,45 +368,106 @@ async def escalate_node(state: State, runtime: Runtime[AgentContext], config: Ru
     try:
         result = await runtime.context.deps.supabase.table("tickets").insert(ticket_data).execute()
         supabase_ticket_id = result.data[0]["id"]
+        print(f"[ticket_node] ✅ Supabase ticket created: id={supabase_ticket_id!r}")
     except Exception as e:
-        print(f"Supabase ticket insert error: {e}")
-        return {"messages": [AIMessage(content="I'm sorry, I wasn't able to log your request just now. Please try again in a moment, or contact our support team directly.")]}
+        print(f"[ticket_node] ❌ Supabase insert failed: {e}")
 
-    jira_key = None
+    return {
+        "supabase_ticket_id": supabase_ticket_id,
+        "ticket_draft_subject": draft.subject,
+        "ticket_draft_description": draft.description,
+        "ticket_draft_category": draft.category,
+    }
+
+
+async def jira_node(state: State, runtime: Runtime[AgentContext]) -> dict:
     jira_config = runtime.context.deps.jira_config
-    if jira_config:
-        config_dict = jira_config.__dict__
-        if all(config_dict.get(k) for k in ("jira_base_url", "jira_email", "jira_token", "jira_project_key")):
-            try:
-                summary = draft.subject
-                description = f"{draft.description}\n\nCategory: {draft.category}\nPriority: {priority}"
-                jira_key = await create_jira_ticket(
-                    admin_config=jira_config.__dict__,
-                    http_client=runtime.context.deps.http_client,
-                    summary=summary,
-                    description=description,
-                    issue_type=jira_config.issue_type or "Task",
-                )
-            except Exception as e:
-                print(f"Jira ticket creation error: {e}")
+    priority = state.get("urgency") or "medium"
 
+    if not jira_config:
+        return {"jira_key": None}
+
+    subject = state.get("ticket_draft_subject") or "Support Escalation"
+    description = state.get("ticket_draft_description") or ""
+    category = state.get("ticket_draft_category") or "other"
+    full_description = f"{description}\n\nCategory: {category}\nPriority: {priority}"
+
+    jira_admin_config = {
+        "jira_base_url": jira_config.base_url,
+        "jira_email": jira_config.email,
+        "jira_token": jira_config.api_token,
+        "jira_project_key": jira_config.project_key,
+        "jira_issue_type": jira_config.issue_type,
+    }
+
+    try:
+        jira_key = await create_jira_ticket(
+            admin_config=jira_admin_config,
+            http_client=runtime.context.deps.http_client,
+            summary=subject,
+            description=full_description,
+            issue_type=jira_config.issue_type or "Task",
+        )
+        return {"jira_key": jira_key}
+    except Exception as e:
+        return {"jira_key": None}
+
+
+async def slack_node(state: State, runtime: Runtime[AgentContext], config: RunnableConfig) -> dict:
     slack_config = runtime.context.deps.slack_config
-    if slack_config and slack_config.bot_token and slack_config.channel_id:
-        try:
-            priority_display = priority.upper()
-            await send_slack_message(
-                admin_config=slack_config.__dict__,
-                http_client=runtime.context.deps.http_client,
-                text=f"🚨 *Escalation Alert* (Priority: {priority_display})\nJira: {jira_key or 'N/A'}\nSupabase: #{supabase_ticket_id}\nThread: {config['configurable']['thread_id']}",
-            )
-        except Exception as e:
-            print(f"Slack notification error: {e}")
+    priority = state.get("urgency") or "medium"
 
-    ticket_display = jira_key or f"Supabase #{supabase_ticket_id}"
-    return {"messages": [AIMessage(content=(
-        "Thank you for reaching out, and I'm sorry for the trouble. I've escalated your request to our "
-        f"support team under ticket **{ticket_display}**. A member of our team will contact you as soon as possible."
-    ))]}
+    if not slack_config:
+        return {"slack_ok": False}
+
+    subject = state.get("ticket_draft_subject") or "Support Escalation"
+    supabase_id = state.get("supabase_ticket_id") or "N/A"
+    jira_key = state.get("jira_key") or "N/A"
+    thread_id = config["configurable"]["thread_id"]
+
+    message = (
+        f"🚨 *New Escalation* (Priority: *{priority.upper()}*)\n"
+        f"*Subject:* {subject}\n"
+        f"*Supabase Ticket:* #{supabase_id}\n"
+        f"*Jira Ticket:* {jira_key}\n"
+        f"*Thread ID:* {thread_id}"
+    )
+
+    slack_admin_config = {
+        "slack_bot_token": slack_config.bot_token,
+        "slack_channel_id": slack_config.channel_id,
+    }
+
+    try:
+        await send_slack_message(
+            admin_config=slack_admin_config,
+            http_client=runtime.context.deps.http_client,
+            text=message,
+        )
+        return {"slack_ok": True}
+    except Exception:
+        return {"slack_ok": False}
+
+
+def combine_node(state: State) -> dict:
+    return {}
+
+
+def finalize_response_node(state: State) -> dict:
+    answer = state.get("answer_text") or ""
+    jira_key = state.get("jira_key")
+    supabase_id = state.get("supabase_ticket_id")
+    ticket_display = jira_key or (f"Supabase #{supabase_id}" if supabase_id else None)
+
+    if ticket_display:
+        combined = (
+            f"{answer}\n\n---\n"
+            f"🚨 **Support Notice:** I have also escalated your request to our support team under ticket "
+            f"**{ticket_display}**. A team member will follow up with you as soon as possible."
+        )
+    else:
+        combined = answer
+    return {"messages": [AIMessage(content=combined)]}
 
 
 def irrelevant_node(state: State) -> dict:
@@ -316,9 +479,14 @@ def create_graph() -> StateGraph:
 
     workflow.add_node("router", routing_decision_node)
     workflow.add_node("knowledge_base", knowledge_base_node)
-    workflow.add_node("answer", answer_node)
     workflow.add_node("database_lookup", database_lookup_node)
-    workflow.add_node("escalate", escalate_node)
+    workflow.add_node("retrieval_join", retrieval_join_node)
+    workflow.add_node("answer", answer_node)
+    workflow.add_node("ticket", escalate_node)
+    workflow.add_node("jira", jira_node)
+    workflow.add_node("slack", slack_node)
+    workflow.add_node("combine", combine_node)
+    workflow.add_node("finalize", finalize_response_node)
     workflow.add_node("irrelevant", irrelevant_node)
     workflow.add_node("summarize", summarize_history_node)
 
@@ -337,24 +505,32 @@ def create_graph() -> StateGraph:
         {
             "knowledge_base": "knowledge_base",
             "database_lookup": "database_lookup",
-            "escalate": "escalate",
             "irrelevant": "irrelevant",
         }
     )
 
     workflow.add_edge("summarize", "router")
-    workflow.add_edge("knowledge_base", "answer")
-    workflow.add_edge("database_lookup", "answer")
+    workflow.add_edge("knowledge_base", "retrieval_join")
+    workflow.add_edge("database_lookup", "retrieval_join")
 
     workflow.add_conditional_edges(
-        "answer",
-        lambda state: "escalate" if state.get("urgency") == "high" else "end",
+        "retrieval_join",
+        route_after_retrieval,
         {
-            "escalate": "escalate",
-            "end": END,
+            "answer": "answer",
+            "escalate": "ticket",
         }
     )
-    workflow.add_edge("escalate", END)
+
+    workflow.add_edge("answer", "combine")
+    workflow.add_edge("jira", "combine")
+    workflow.add_edge("slack", "combine")
+    workflow.add_edge("combine", "finalize")
+
+    workflow.add_edge("ticket", "jira")
+    workflow.add_edge("ticket", "slack")
+
+    workflow.add_edge("finalize", END)
     workflow.add_edge("irrelevant", END)
 
     return workflow

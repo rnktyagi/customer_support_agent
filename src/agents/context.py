@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
+import httpx
 from langchain_openai import ChatOpenAI
 from supabase import Client
 from sqlalchemy.engine import Engine
@@ -36,6 +37,7 @@ class Deps:
     supabase: Client
     jira_config: Optional[JiraConfig] = None
     slack_config: Optional[SlackConfig] = None
+    http_client: Optional[httpx.AsyncClient] = None
 
 
 @dataclass

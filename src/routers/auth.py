@@ -52,6 +52,7 @@ async def admin_signin(body: Credentials, request: Request):
     return {
         "admin_id": admin.data["id"],
         "admin_code": admin.data["code"],
+        "access_token": result.session.access_token if result.session else None,
         "database_url": admin.data.get("database_url"),
         "identity_table": admin.data.get("identity_table"),
         "pk_column": admin.data.get("pk_column"),

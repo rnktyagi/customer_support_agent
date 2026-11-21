@@ -1,20 +1,42 @@
 from typing import Tuple, Optional
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, Request
 from sqlalchemy import create_engine, text
 
 import os
 import httpx
-import json
+
+
+
+def get_supabase(request: Request):
+    return getattr(request.app.state, "supabase", None)
+
+def get_supabase_auth(request: Request):
+    return getattr(request.app.state, "supabase_auth", None)
+
+def get_scheme_embedding(request: Request):
+    return getattr(request.app.state, "scheme_embedding", None)
+
+def get_kb_embedding(request: Request):
+    return getattr(request.app.state, "kb_embedding", None)
+
+def get_deps(request: Request):
+    return getattr(request.app.state, "deps", None)
+
+def get_agent(request: Request):
+    return getattr(request.app.state, "agent", None)
 
 
 async def get_current_user(
-    authorization: str = Header(..., alias="Authorization"),
-    supabase_auth=Depends(lambda r: r.app.state.supabase_auth),
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    supabase_auth=Depends(get_supabase_auth),
 ):
-    if not authorization.lower().startswith("bearer "):
+    if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing Bearer token.")
     token = authorization.split(" ", 1)[1].strip()
-    user = await supabase_auth.auth.get_user(token)
+    try:
+        user = await supabase_auth.auth.get_user(token)
+    except Exception:
+        raise HTTPException(401, "Invalid or expired token.")
     if not user or not user.user:
         raise HTTPException(401, "Invalid or expired token.")
     return user.user
@@ -22,7 +44,7 @@ async def get_current_user(
 
 async def resolve_customer_context(
     user=Depends(get_current_user),
-    supabase=Depends(lambda r: r.app.state.supabase),
+    supabase=Depends(get_supabase),
 ) -> Tuple[str, str, str]:
     supabase_user_id = user.id
     email = user.email
@@ -34,36 +56,54 @@ async def resolve_customer_context(
     return supabase_user_id, customer.data["admin_id"], email
 
 
-async def get_supabase_user_id(customer_ctx=Depends(resolve_customer_context)) -> str:
-    return customer_ctx[0]
-
-
-async def get_admin_id(customer_ctx=Depends(resolve_customer_context)) -> str:
-    return customer_ctx[1]
-
-
-async def get_user_email(customer_ctx=Depends(resolve_customer_context)) -> str:
-    return customer_ctx[2]
-
-
 async def resolve_admin_context(
-    user=Depends(get_current_user),
-    supabase=Depends(lambda r: r.app.state.supabase),
+    request: Request,
+    authorization: Optional[str] = Header(None, alias="Authorization"),
+    supabase=Depends(get_supabase),
+    supabase_auth=Depends(get_supabase_auth),
 ) -> Tuple[str, str]:
-    admin_id = user.id
-    email = user.email
-    admin = await supabase.table("admins").select("id").eq("id", admin_id).maybe_single().execute()
-    if not admin or not admin.data:
-        raise HTTPException(403, "This is not an admin account.")
-    return admin_id, email
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        try:
+            user_resp = await supabase_auth.auth.get_user(token)
+            if user_resp and user_resp.user:
+                user = user_resp.user
+                admin = await supabase.table("admins").select("id").eq("user_id", user.id).maybe_single().execute()
+                if admin and admin.data:
+                    return admin.data["id"], user.email or ""
+        except Exception:
+            pass
+
+    admin_id = None
+    try:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+            if isinstance(body, dict):
+                admin_id = body.get("admin_id")
+        elif "multipart/form-data" in content_type or "application/x-www-form-urlencoded" in content_type:
+            form = await request.form()
+            admin_id = form.get("admin_id")
+    except Exception:
+        pass
+
+    if not admin_id:
+        admin_id = request.query_params.get("admin_id")
+
+    if admin_id:
+        admin = await supabase.table("admins").select("id").eq("id", admin_id).maybe_single().execute()
+        if admin and admin.data:
+            return admin.data["id"], ""
+
+    raise HTTPException(status_code=401, detail="Authentication failed: Missing or invalid credentials.")
 
 
 async def get_admin_config(
     admin_id: str,
-    supabase=Depends(lambda r: r.app.state.supabase),
+    supabase=Depends(get_supabase),
 ) -> dict:
     admin = await supabase.table("admins").select(
-        "database_url, identity_table, pk_column, email_column"
+        "database_url, identity_table, pk_column, email_column, jira_base_url, jira_email, jira_token, jira_project_key, jira_issue_type, slack_bot_token, slack_channel_id"
     ).eq("id", admin_id).maybe_single().execute()
     if not admin or not admin.data:
         raise HTTPException(403, "Invalid admin_id.")
@@ -75,7 +115,7 @@ async def get_admin_config(
 
 async def get_db_engine(
     admin_id: str,
-    supabase=Depends(lambda r: r.app.state.supabase),
+    supabase=Depends(get_supabase),
 ):
     admin = await supabase.table("admins").select("database_url").eq("id", admin_id).maybe_single().execute()
     if not admin or not admin.data or not admin.data.get("database_url"):
@@ -88,9 +128,9 @@ async def get_db_engine(
 
 
 async def get_customer_pk(
-    engine=Depends(get_db_engine),
-    admin_config=Depends(get_admin_config),
-    email: str = None,
+    engine,
+    admin_config: dict,
+    email: str,
 ) -> str:
     with engine.connect() as conn:
         result = conn.execute(
@@ -103,98 +143,45 @@ async def get_customer_pk(
 
 
 async def get_chat_context(
-    supabase_user_id=Depends(get_supabase_user_id),
-    admin_id=Depends(get_admin_id),
-    customer_pk=Depends(get_customer_pk),
+    customer_ctx=Depends(resolve_customer_context),
     admin_config=Depends(get_admin_config),
     engine=Depends(get_db_engine),
-    deps=Depends(lambda r: r.app.state.deps),
+    deps=Depends(get_deps),
 ):
-    from src.agents.context import AgentContext
+    from src.agents.context import AgentContext, Deps, JiraConfig, SlackConfig
+
+    supabase_user_id, admin_id, email = customer_ctx
+    customer_pk = await get_customer_pk(engine, admin_config, email)
+
+    jira_cfg = JiraConfig(
+        base_url=admin_config.get("jira_base_url", ""),
+        email=admin_config.get("jira_email", ""),
+        api_token=admin_config.get("jira_token", ""),
+        project_key=admin_config.get("jira_project_key", ""),
+        issue_type=admin_config.get("jira_issue_type", "Task"),
+    )
+    slack_cfg = SlackConfig(
+        bot_token=admin_config.get("slack_bot_token", ""),
+        channel_id=admin_config.get("slack_channel_id", ""),
+    )
+
+    request_deps = Deps(
+        kb_retriever=deps.kb_retriever,
+        scheme_retriever=deps.scheme_retriever,
+        jev=deps.jev,
+        llm=deps.llm,
+        sql_llm=deps.sql_llm,
+        summarizer_llm=deps.summarizer_llm,
+        supabase=deps.supabase,
+        http_client=deps.http_client,
+        jira_config=jira_cfg,
+        slack_config=slack_cfg,
+    )
     return AgentContext(
-        deps=deps,
+        deps=request_deps,
         admin_id=admin_id,
         user_id=supabase_user_id,
         customer_pk=customer_pk,
         tenant_pk_column=admin_config["pk_column"],
         engine=engine,
     )
-
-
-async def create_jira_ticket(
-    admin_config: dict,
-    http_client: httpx.AsyncClient,
-    summary: str,
-    description: str,
-    issue_type: str = "Task",
-) -> Optional[str]:
-    base_url = admin_config.get("jira_base_url", "").rstrip("/")
-    email = admin_config.get("jira_email", "")
-    api_token = admin_config.get("jira_token", "")
-    project_key = admin_config.get("jira_project_key", "")
-    issue_type = issue_type or admin_config.get("jira_issue_type", "Task")
-
-    if not all([base_url, email, api_token, project_key]):
-        raise HTTPException(400, "Jira configuration incomplete for this admin.")
-
-    url = f"{base_url}/rest/api/3/issue"
-    auth = (email, api_token)
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "fields": {
-            "project": {"key": project_key},
-            "summary": summary,
-            "description": {
-                "type": "doc",
-                "version": 1,
-                "content": [
-                    {
-                        "type": "paragraph",
-                        "content": [{"type": "text", "text": description}]
-                    }
-                ]
-            },
-            "issuetype": {"name": issue_type},
-        }
-    }
-
-    resp = await http_client.post(url, json=payload, headers=headers, auth=auth)
-    if resp.status_code not in (200, 201):
-        raise HTTPException(500, f"Jira API error: {resp.status_code} - {resp.text}")
-    return resp.json().get("key")
-
-
-async def send_slack_message(
-    admin_config: dict,
-    http_client: httpx.AsyncClient,
-    text: str,
-    blocks: Optional[list] = None,
-) -> bool:
-    bot_token = admin_config.get("slack_bot_token", "")
-    channel_id = admin_config.get("slack_channel_id", "")
-
-    if not bot_token or not channel_id:
-        raise HTTPException(400, "Slack configuration incomplete for this admin.")
-
-    url = "https://slack.com/api/chat.postMessage"
-    headers = {
-        "Authorization": f"Bearer {bot_token}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "channel": channel_id,
-        "text": text,
-    }
-    if blocks:
-        payload["blocks"] = blocks
-
-    resp = await http_client.post(url, json=payload, headers=headers)
-    if resp.status_code != 200:
-        raise HTTPException(500, f"Slack API error: {resp.status_code} - {resp.text}")
-    data = resp.json()
-    if not data.get("ok"):
-        raise HTTPException(500, f"Slack API error: {data.get('error')}")
-    return True
